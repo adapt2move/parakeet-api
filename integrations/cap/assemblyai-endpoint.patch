@@ -1,5 +1,5 @@
 diff --git a/apps/web/__tests__/unit/transcribe-language.test.ts b/apps/web/__tests__/unit/transcribe-language.test.ts
-index c315acb..6c6aa41 100644
+index c315acb..8283cca 100644
 --- a/apps/web/__tests__/unit/transcribe-language.test.ts
 +++ b/apps/web/__tests__/unit/transcribe-language.test.ts
 @@ -4,8 +4,23 @@ import {
@@ -42,7 +42,7 @@ index c315acb..6c6aa41 100644
  			throw new Error("Expected automatic language detection options");
  		}
  		expect(options.language_detection_options.expected_languages).toEqual(
-@@ -48,3 +66,45 @@ describe("AI generation language support", () => {
+@@ -48,3 +66,43 @@ describe("AI generation language support", () => {
  		});
  	});
  });
@@ -76,13 +76,11 @@ index c315acb..6c6aa41 100644
 +		["http://parakeet-api:8080", "http://parakeet-api:8080"],
 +	])("uses the configured endpoint %s", async (configured, expected) => {
 +		env.ASSEMBLYAI_BASE_URL = configured;
-+		const fetch = vi
-+			.fn()
-+			.mockResolvedValue(
-+				new Response(JSON.stringify({ id: "test", status: "queued" }), {
-+					status: 200,
-+				}),
-+			);
++		const fetch = vi.fn().mockResolvedValue(
++			new Response(JSON.stringify({ id: "test", status: "queued" }), {
++				status: 200,
++			}),
++		);
 +		vi.stubGlobal("fetch", fetch);
 +		await createAssemblyAIClient().transcripts.get("test");
 +		expect(fetch.mock.calls[0]?.[0]).toBe(`${expected}/v2/transcript/test`);
