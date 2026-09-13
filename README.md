@@ -1,7 +1,5 @@
 # Parakeet API
 
-Developed by **Adapt2Move GmbH**. Copyright 2026 Adapt2Move GmbH and contributors.
-
 CPU transcription using NVIDIA Parakeet TDT 0.6B v3 INT8, with OpenAI and AssemblyAI file transcription endpoints. One small API owns an in-memory SQLite job queue by default. Each worker runs one model and claims jobs over HTTP. No PostgreSQL, Redis, GPU or external inference service is required.
 
 This is an initial implementation. The compatibility table below defines the supported subset. It is not a replacement for every feature of either hosted service.
@@ -160,5 +158,7 @@ uv run python scripts/smoke.py /path/to/recording.m4a
 The smoke test submits three queued AssemblyAI requests and one OpenAI request, checks matching word timestamps, deletes results, then removes its containers and volumes. A quality benchmark needs a separate reference transcript; this smoke test does not measure word error rate.
 
 ## License
+
+Copyright 2026 Adapt2Move GmbH and contributors.
 
 Application code is licensed under [EUPL-1.2](LICENSE). The worker contains [NVIDIA Parakeet TDT 0.6B v3](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3) weights under CC-BY-4.0, converted to INT8 ONNX by [sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx). See [NOTICE](NOTICE) for attribution and the pinned archive checksum. Dependencies retain their own licenses. This project is not affiliated with OpenAI or AssemblyAI.
