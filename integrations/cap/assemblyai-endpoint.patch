@@ -1,0 +1,254 @@
+diff --git a/apps/web/__tests__/unit/transcribe-language.test.ts b/apps/web/__tests__/unit/transcribe-language.test.ts
+index c315acb..6c6aa41 100644
+--- a/apps/web/__tests__/unit/transcribe-language.test.ts
++++ b/apps/web/__tests__/unit/transcribe-language.test.ts
+@@ -4,8 +4,23 @@ import {
+ 	isAiGenerationLanguage,
+ 	parseAiGenerationLanguage,
+ } from "@cap/web-domain";
+-import { describe, expect, it } from "vitest";
+-import { getAssemblyAITranscriptionOptions } from "@/lib/assemblyai";
++import { afterEach, describe, expect, it, vi } from "vitest";
++import {
++	createAssemblyAIClient,
++	getAssemblyAITranscriptionOptions,
++} from "@/lib/assemblyai";
++
++const env = vi.hoisted(() => ({
++	ASSEMBLY_API_KEY: "test-key",
++	ASSEMBLYAI_BASE_URL: undefined as string | undefined,
++	ASSEMBLYAI_TRANSCRIPTION_PROFILE: "assemblyai",
++}));
++vi.mock("@cap/env", () => ({ serverEnv: () => env }));
++afterEach(() => {
++	env.ASSEMBLYAI_BASE_URL = undefined;
++	env.ASSEMBLYAI_TRANSCRIPTION_PROFILE = "assemblyai";
++	vi.unstubAllGlobals();
++});
+ 
+ describe("AI generation language support", () => {
+ 	it("exposes Romanian for AI generation", () => {
+@@ -27,8 +42,11 @@ describe("AI generation language support", () => {
+ 			speech_models: ["universal-3-5-pro", "universal-2"],
+ 			language_detection: true,
+ 		});
+-		expect(options.disfluencies).toBe(true);
+-		if (!("language_detection_options" in options)) {
++		expect(options).toHaveProperty("disfluencies", true);
++		if (
++			!("language_detection_options" in options) ||
++			!options.language_detection_options
++		) {
+ 			throw new Error("Expected automatic language detection options");
+ 		}
+ 		expect(options.language_detection_options.expected_languages).toEqual(
+@@ -48,3 +66,45 @@ describe("AI generation language support", () => {
+ 		});
+ 	});
+ });
++
++describe("Parakeet transcription profile", () => {
++	it("submits auto language without unsupported AssemblyAI features", () => {
++		expect(getAssemblyAITranscriptionOptions("auto", "parakeet")).toEqual({});
++	});
++
++	it("passes the explicit language label without changing cloud defaults", () => {
++		expect(getAssemblyAITranscriptionOptions("de", "parakeet")).toEqual({
++			language_code: "de",
++		});
++		expect(getAssemblyAITranscriptionOptions("de")).toMatchObject({
++			speech_models: ["universal-3-5-pro", "universal-2"],
++			disfluencies: true,
++		});
++	});
++});
++
++describe("AssemblyAI endpoint configuration", () => {
++	it("refuses Parakeet without an explicit endpoint", () => {
++		env.ASSEMBLYAI_TRANSCRIPTION_PROFILE = "parakeet";
++		expect(() => createAssemblyAIClient()).toThrow(
++			"Parakeet requires ASSEMBLYAI_BASE_URL",
++		);
++	});
++
++	it.each([
++		[undefined, "https://api.assemblyai.com"],
++		["http://parakeet-api:8080", "http://parakeet-api:8080"],
++	])("uses the configured endpoint %s", async (configured, expected) => {
++		env.ASSEMBLYAI_BASE_URL = configured;
++		const fetch = vi
++			.fn()
++			.mockResolvedValue(
++				new Response(JSON.stringify({ id: "test", status: "queued" }), {
++					status: 200,
++				}),
++			);
++		vi.stubGlobal("fetch", fetch);
++		await createAssemblyAIClient().transcripts.get("test");
++		expect(fetch.mock.calls[0]?.[0]).toBe(`${expected}/v2/transcript/test`);
++	});
++});
+diff --git a/apps/web/lib/assemblyai.ts b/apps/web/lib/assemblyai.ts
+index 0c743dc..88ef6fe 100644
+--- a/apps/web/lib/assemblyai.ts
++++ b/apps/web/lib/assemblyai.ts
+@@ -1,8 +1,10 @@
++import { serverEnv } from "@cap/env";
+ import {
+ 	AI_GENERATION_LANGUAGE_AUTO,
+ 	type AiGenerationLanguage,
+ 	type AiGenerationLanguageCode,
+ } from "@cap/web-domain";
++import { AssemblyAI } from "assemblyai";
+ 
+ export const ASSEMBLYAI_SPEECH_MODELS = [
+ 	"universal-3-5-pro",
+@@ -37,9 +39,30 @@ export const ASSEMBLYAI_SUPPORTED_LANGUAGES = [
+ 	"he",
+ ] as const satisfies readonly AiGenerationLanguageCode[];
+ 
++export function createAssemblyAIClient() {
++	const env = serverEnv();
++	if (
++		env.ASSEMBLYAI_TRANSCRIPTION_PROFILE === "parakeet" &&
++		!env.ASSEMBLYAI_BASE_URL
++	) {
++		throw new Error("Parakeet requires ASSEMBLYAI_BASE_URL");
++	}
++	return new AssemblyAI({
++		apiKey: env.ASSEMBLY_API_KEY ?? "",
++		baseUrl: env.ASSEMBLYAI_BASE_URL,
++	});
++}
++
+ export function getAssemblyAITranscriptionOptions(
+ 	language: AiGenerationLanguage,
++	profile: "assemblyai" | "parakeet" = "assemblyai",
+ ) {
++	if (profile === "parakeet") {
++		return language === AI_GENERATION_LANGUAGE_AUTO
++			? {}
++			: { language_code: language };
++	}
++
+ 	const baseOptions = {
+ 		speech_models: [...ASSEMBLYAI_SPEECH_MODELS],
+ 		format_text: true,
+diff --git a/apps/web/workflows/live-transcribe.ts b/apps/web/workflows/live-transcribe.ts
+index 04cab10..4dca076 100644
+--- a/apps/web/workflows/live-transcribe.ts
++++ b/apps/web/workflows/live-transcribe.ts
+@@ -8,13 +8,13 @@ import {
+ 	type User,
+ 	Video,
+ } from "@cap/web-domain";
+-import { AssemblyAI } from "assemblyai";
+ import { and, eq, isNull, sql } from "drizzle-orm";
+ import { Either, Option, Schema } from "effect";
+ import { isAiGenerationEnabledForUser } from "@/lib/ai-generation-entitlement";
+ import {
+ 	ASSEMBLYAI_SPEECH_MODELS,
+ 	ASSEMBLYAI_SUPPORTED_LANGUAGES,
++	createAssemblyAIClient,
+ 	getAssemblyAITranscriptionOptions,
+ } from "@/lib/assemblyai";
+ import {
+@@ -433,9 +433,7 @@ async function processNextLiveChunk(options: {
+ 		// ffmpeg — the binary doesn't exist in the serverless runtime.
+ 		const audioBuffer = await downloadConcatenatedSegmentsToBuffer(segmentUrls);
+ 
+-		const client = new AssemblyAI({
+-			apiKey: serverEnv().ASSEMBLY_API_KEY as string,
+-		});
++		const client = createAssemblyAIClient();
+ 		const language = (
+ 			ASSEMBLYAI_SUPPORTED_LANGUAGES as readonly string[]
+ 		).includes(options.language)
+@@ -443,8 +441,10 @@ async function processNextLiveChunk(options: {
+ 			: ("auto" as AiGenerationLanguage);
+ 		const transcript = await client.transcripts.transcribe({
+ 			audio: audioBuffer,
+-			...getAssemblyAITranscriptionOptions(language),
+-			disfluencies: true,
++			...getAssemblyAITranscriptionOptions(
++				language,
++				serverEnv().ASSEMBLYAI_TRANSCRIPTION_PROFILE,
++			),
+ 		});
+ 
+ 		const noSpokenAudio = isNoSpokenAudioError(transcript);
+diff --git a/apps/web/workflows/transcribe.ts b/apps/web/workflows/transcribe.ts
+index a281d25..724b2b0 100644
+--- a/apps/web/workflows/transcribe.ts
++++ b/apps/web/workflows/transcribe.ts
+@@ -17,12 +17,14 @@ import {
+ 	parseAiGenerationLanguage,
+ 	Video,
+ } from "@cap/web-domain";
+-import { AssemblyAI } from "assemblyai";
+ import { and, eq, isNull, sql } from "drizzle-orm";
+ import { Either, Option, Schema } from "effect";
+ import { FatalError } from "workflow";
+ import { start } from "workflow/api";
+-import { getAssemblyAITranscriptionOptions } from "@/lib/assemblyai";
++import {
++	createAssemblyAIClient,
++	getAssemblyAITranscriptionOptions,
++} from "@/lib/assemblyai";
+ import {
+ 	ENHANCED_AUDIO_CONTENT_TYPE,
+ 	ENHANCED_AUDIO_EXTENSION,
+@@ -782,14 +784,14 @@ async function transcribeWithAssemblyAI(
+ 	}
+ 
+ 	const audioBuffer = Buffer.from(await audioResponse.arrayBuffer());
+-	const client = new AssemblyAI({
+-		apiKey: serverEnv().ASSEMBLY_API_KEY as string,
+-	});
++	const client = createAssemblyAIClient();
+ 
+ 	const transcript = await client.transcripts.transcribe({
+ 		audio: audioBuffer,
+-		...getAssemblyAITranscriptionOptions(language),
+-		disfluencies: true,
++		...getAssemblyAITranscriptionOptions(
++			language,
++			serverEnv().ASSEMBLYAI_TRANSCRIPTION_PROFILE,
++		),
+ 	});
+ 
+ 	console.log(
+@@ -835,13 +837,13 @@ async function transcribeEditTranscriptWithAssemblyAI(
+ 	}
+ 
+ 	const audioBuffer = Buffer.from(await audioResponse.arrayBuffer());
+-	const client = new AssemblyAI({
+-		apiKey: serverEnv().ASSEMBLY_API_KEY as string,
+-	});
++	const client = createAssemblyAIClient();
+ 	const transcript = await client.transcripts.transcribe({
+ 		audio: audioBuffer,
+-		...getAssemblyAITranscriptionOptions("auto"),
+-		disfluencies: true,
++		...getAssemblyAITranscriptionOptions(
++			"auto",
++			serverEnv().ASSEMBLYAI_TRANSCRIPTION_PROFILE,
++		),
+ 	});
+ 
+ 	console.log(
+diff --git a/packages/env/server.ts b/packages/env/server.ts
+index f2fcc43..afeafc3 100644
+--- a/packages/env/server.ts
++++ b/packages/env/server.ts
+@@ -90,6 +90,10 @@ function createServerEnv() {
+ 
+ 			/// AI providers
+ 			ASSEMBLY_API_KEY: z.string().optional().describe("Audio transcription"),
++			ASSEMBLYAI_BASE_URL: z.string().url().optional(),
++			ASSEMBLYAI_TRANSCRIPTION_PROFILE: z
++				.enum(["assemblyai", "parakeet"])
++				.default("assemblyai"),
+ 			ANTHROPIC_API_KEY: z.string().optional().describe("AI chat"),
+ 			OPENAI_API_KEY: z.string().optional().describe("AI summaries"),
+ 			GROQ_API_KEY: z.string().optional().describe("AI summaries"),
