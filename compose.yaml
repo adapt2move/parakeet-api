@@ -10,6 +10,7 @@ services:
     environment:
       API_KEY: ${API_KEY:?Set API_KEY}
       WORKER_API_KEY: ${WORKER_API_KEY:?Set WORKER_API_KEY}
+      DB_MODE: ${DB_MODE:-memory}
       PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:-http://localhost:8080}
     volumes:
       - data:/data

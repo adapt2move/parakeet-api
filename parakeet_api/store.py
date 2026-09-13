@@ -2,6 +2,7 @@
 
 import json
 import sqlite3
+import threading
 import time
 import uuid
 from contextlib import contextmanager
@@ -16,8 +17,22 @@ class Store:
         self.blobs = self.s.data / "audio"
         self.blobs.mkdir(exist_ok=True)
         self.path = self.s.data / "jobs.sqlite3"
+        if self.s.db_mode not in ("memory", "file"):
+            raise ValueError("DB_MODE must be memory or file")
+        self.lock = threading.RLock()
+        self.memory = None
+        if self.s.db_mode == "memory":
+            if self.path.exists():
+                raise ValueError(
+                    "Use a fresh DATA_DIR for memory mode, or DB_MODE=file for existing SQLite data"
+                )
+            # This directory belongs exclusively to this API instance. A memory
+            # queue cannot recover uploads left by its previous process.
+            for path in self.blobs.iterdir():
+                path.unlink()
+            self.memory = sqlite3.connect(":memory:", check_same_thread=False)
         with self.connect() as db:
-            db.execute("PRAGMA journal_mode=WAL")
+            db.execute("PRAGMA journal_mode=" + ("MEMORY" if self.memory is not None else "WAL"))
             db.execute("PRAGMA secure_delete=ON")
             version = db.execute("PRAGMA user_version").fetchone()[0]
             if version not in (0, 1):
@@ -37,15 +52,25 @@ class Store:
 
     @contextmanager
     def connect(self):
-        db = sqlite3.connect(self.path, timeout=10)
-        db.row_factory = sqlite3.Row
-        db.execute("PRAGMA foreign_keys=ON")
-        db.execute("PRAGMA secure_delete=ON")
-        try:
-            with db:
-                yield db
-        finally:
-            db.close()
+        # One long-lived connection keeps :memory: alive. Serialize transactions
+        # across the HTTP event loop and cleanup thread without shared-cache mode.
+        with self.lock:
+            db = self.memory if self.memory is not None else sqlite3.connect(self.path, timeout=10)
+            db.row_factory = sqlite3.Row
+            db.execute("PRAGMA foreign_keys=ON")
+            db.execute("PRAGMA secure_delete=ON")
+            db.execute("PRAGMA temp_store=MEMORY")
+            try:
+                with db:
+                    yield db
+            finally:
+                if self.memory is None:
+                    db.close()
+
+    def close(self):
+        with self.lock:
+            if self.memory is not None:
+                self.memory.close()
 
     def reserve(self):
         with self.connect() as db:

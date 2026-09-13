@@ -11,20 +11,17 @@ import sherpa_onnx
 from .alignment import words_from_result
 from .chunking import merge_words, validate_duration, windows
 from .formats import Result
+from .model import model_files
 
 
 class Engine:
     def __init__(self):
-        models = Path(os.getenv("MODEL_DIR", "/models"))
         self.max_seconds = int(os.getenv("MAX_AUDIO_SECONDS", "10800"))
         self.timeout = int(os.getenv("JOB_TIMEOUT_SECONDS", "1800"))
         if not 1 <= self.max_seconds <= 10800 or self.timeout < 1:
             raise ValueError("Invalid worker duration/time limit")
         self.recognizer = sherpa_onnx.OfflineRecognizer.from_transducer(
-            encoder=str(models / "encoder.int8.onnx"),
-            decoder=str(models / "decoder.int8.onnx"),
-            joiner=str(models / "joiner.int8.onnx"),
-            tokens=str(models / "tokens.txt"),
+            **model_files(),
             num_threads=int(os.getenv("PARAKEET_THREADS", "3")),
             model_type="nemo_transducer",
             provider="cpu",

@@ -10,7 +10,8 @@ RUN pip install --no-cache-dir uv==0.8.22
 COPY pyproject.toml uv.lock ./
 RUN uv sync --frozen --no-dev --no-install-project
 LABEL org.opencontainers.image.source="https://github.com/adapt2move/parakeet-api" \
-      org.opencontainers.image.licenses="EUPL-1.2"
+      org.opencontainers.image.licenses="EUPL-1.2" \
+      org.opencontainers.image.vendor="Adapt2Move GmbH"
 
 FROM base AS api
 RUN mkdir /data && chown 10001:10001 /data

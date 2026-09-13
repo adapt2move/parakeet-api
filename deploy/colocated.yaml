@@ -7,18 +7,6 @@ metadata:
     pod-security.kubernetes.io/enforce: restricted
 ---
 apiVersion: v1
-kind: PersistentVolumeClaim
-metadata:
-  name: parakeet-data
-  namespace: parakeet
-spec:
-  accessModes:
-  - ReadWriteOnce
-  resources:
-    requests:
-      storage: 4Gi
----
-apiVersion: v1
 kind: Service
 metadata:
   name: parakeet-api
@@ -76,6 +64,8 @@ spec:
               key: WORKER_API_KEY
         - name: PUBLIC_BASE_URL
           value: http://parakeet-api.parakeet.svc.cluster.local:8080
+        - name: DB_MODE
+          value: memory
         resources:
           requests:
             cpu: 100m
@@ -84,7 +74,7 @@ spec:
           limits:
             cpu: 500m
             memory: 512Mi
-            ephemeral-storage: 1Gi
+            ephemeral-storage: 4Gi
         volumeMounts:
         - name: data
           mountPath: /data
@@ -166,8 +156,8 @@ spec:
           failureThreshold: 60
       volumes:
       - name: data
-        persistentVolumeClaim:
-          claimName: parakeet-data
+        emptyDir:
+          sizeLimit: 3Gi
       - name: api-tmp
         emptyDir:
           sizeLimit: 384Mi

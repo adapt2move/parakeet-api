@@ -58,10 +58,13 @@ def create_app(settings=None):
                     await asyncio.sleep(30)
 
             task = asyncio.create_task(janitor())
-            yield
-            task.cancel()
-            with suppress(asyncio.CancelledError):
-                await task
+            try:
+                yield
+            finally:
+                task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await task
+                app.state.store.close()
 
     app = FastAPI(title="Parakeet API", version="0.1.0", lifespan=lifespan, docs_url=None, redoc_url=None)
 

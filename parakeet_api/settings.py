@@ -8,6 +8,7 @@ from pathlib import Path
 @dataclass(frozen=True)
 class Settings:
     data: Path = Path(os.getenv("DATA_DIR", "/data"))
+    db_mode: str = os.getenv("DB_MODE", "memory")
     api_key: str = os.getenv("API_KEY", "")
     worker_key: str = os.getenv("WORKER_API_KEY", "")
     public_url: str = os.getenv("PUBLIC_BASE_URL", "http://localhost:8080").rstrip("/")
@@ -22,6 +23,8 @@ class Settings:
     url_hosts: tuple[str, ...] = tuple(filter(None, os.getenv("AUDIO_URL_HOSTS", "").split(",")))
 
     def validate(self):
+        if self.db_mode not in ("memory", "file"):
+            raise ValueError("DB_MODE must be memory or file")
         if min(len(self.api_key), len(self.worker_key)) < 32 or self.api_key == self.worker_key:
             raise ValueError("Set distinct API_KEY and WORKER_API_KEY values of at least 32 characters")
         if (

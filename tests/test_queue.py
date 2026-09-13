@@ -24,7 +24,7 @@ def test_claim_is_exclusive_and_recovers_after_restart(settings, result):
     first = next(c for c in claims if c)
     with store.connect() as db:
         db.execute("UPDATE jobs SET lease=0 WHERE id=?", (job["id"],))
-    restarted = Store(settings)
+    restarted = Store(settings) if settings.db_mode == "file" else store
     second = restarted.claim()
     assert second["id"] == first["id"] and second["token"] != first["token"]
     with pytest.raises(HTTPException) as stale:
@@ -96,3 +96,27 @@ def test_cleanup_removes_crash_orphans_but_preserves_recent_files(settings):
     recent.write_bytes(b"audio")
     store.cleanup()
     assert not stale.exists() and recent.exists()
+
+
+def test_memory_queue_is_process_local_and_removes_stale_uploads(settings):
+    if settings.db_mode != "memory":
+        return
+    store = Store(settings)
+    job = submit(store)
+    assert not store.path.exists()
+    assert store.get(job["id"])["status"] == "queued"
+    store.close()
+    restarted = Store(settings)
+    assert restarted.counts() == {}
+    assert not list(restarted.blobs.iterdir())
+    assert not restarted.path.exists()
+    restarted.close()
+
+
+def test_memory_mode_does_not_destroy_existing_file_database(settings):
+    disk = Store(replace(settings, db_mode="file"))
+    job = submit(disk)
+    with pytest.raises(ValueError, match="fresh DATA_DIR"):
+        Store(replace(settings, db_mode="memory"))
+    assert disk.get(job["id"])["status"] == "queued"
+    assert (disk.blobs / job["upload_id"]).exists()

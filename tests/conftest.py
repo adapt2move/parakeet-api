@@ -5,10 +5,11 @@ from parakeet_api.api import create_app
 from parakeet_api.settings import Settings
 
 
-@pytest.fixture
-def settings(tmp_path):
+@pytest.fixture(params=["file", "memory"])
+def settings(tmp_path, request):
     return Settings(
         data=tmp_path,
+        db_mode=request.param,
         api_key="client-" + "x" * 32,
         worker_key="worker-" + "y" * 32,
         max_bytes=1024,

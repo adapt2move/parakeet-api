@@ -1,6 +1,8 @@
 # Parakeet API
 
-CPU transcription using NVIDIA Parakeet TDT 0.6B v3 INT8, with OpenAI and AssemblyAI file transcription endpoints. One small API owns a SQLite job queue. Each worker runs one model and claims jobs over HTTP. No PostgreSQL, Redis, GPU or external inference service is required.
+Developed by **Adapt2Move GmbH**. Copyright 2026 Adapt2Move GmbH and contributors.
+
+CPU transcription using NVIDIA Parakeet TDT 0.6B v3 INT8, with OpenAI and AssemblyAI file transcription endpoints. One small API owns an in-memory SQLite job queue by default. Each worker runs one model and claims jobs over HTTP. No PostgreSQL, Redis, GPU or external inference service is required.
 
 This is an initial implementation. The compatibility table below defines the supported subset. It is not a replacement for every feature of either hosted service.
 
@@ -16,7 +18,7 @@ openssl rand -hex 32
 docker compose up --build -d
 ```
 
-The API listens on `127.0.0.1:8080`. Compose limits the API to 0.25 CPU / 384 MiB and the worker to 1.75 CPU / 4 GiB. Uploaded audio and SQLite live in a Docker volume. Worker scratch uses a separate disk volume. `docker compose down -v` deletes these volumes and any unfinished work.
+The API listens on `127.0.0.1:8080`. Compose limits the API to 0.25 CPU / 384 MiB and the worker to 1.75 CPU / 4 GiB. SQLite stays in API process memory. Uploaded audio uses a Docker scratch volume and is removed on API restart in memory mode. Worker scratch uses a separate disk volume. `docker compose down -v` deletes these volumes and any unfinished work.
 
 For published images, use `docker compose up -d --no-build`. Images are `ghcr.io/adapt2move/parakeet-api` and `ghcr.io/adapt2move/parakeet-worker`, for Linux amd64 and arm64. CI publishes `main`, full `sha-<commit>` tags, and version tags when a `v*` Git tag is pushed. Pin a digest for deployment. Each image pair is tested with real inference before publication.
 
@@ -76,14 +78,34 @@ These are acoustic decoder alignments, not independently verified forced alignme
 
 Supported containers include WAV, M4A/MP4, MP3, FLAC, Ogg, WebM and other explicitly allowed FFmpeg formats. Audio must finish uploading before inference starts. HTTP chunked transfer is accepted by `/v2/upload`; that does not provide live transcription. Raw PCM without a container is not supported.
 
+## Model configuration
+
+The bundled and inference-tested default is Parakeet TDT 0.6B v3 INT8. INT8 is an ONNX export variant, not the only possible precision. The [upstream export script](https://github.com/k2-fsa/sherpa-onnx/blob/master/scripts/nemo/parakeet-tdt-0.6b-v3/export_onnx.py) creates unquantized ONNX files and then quantizes them to INT8. A compatible FP32 export can be mounted without rebuilding the API or installing a different Python stack:
+
+```yaml
+# Add to the worker service in a Compose override:
+services:
+  worker:
+    environment:
+      MODEL_DIR: /custom-model
+      MODEL_PRECISION: fp32
+    volumes:
+      - ./models/parakeet-v3-fp32:/custom-model:ro
+```
+
+`MODEL_PRECISION=int8` selects `encoder.int8.onnx`, `decoder.int8.onnx` and `joiner.int8.onnx`. `fp32` selects `encoder.onnx`, `decoder.onnx` and `joiner.onnx`. Both use `tokens.txt`. Mount the complete export directory, including external tensor files such as `encoder.weights` for FP32. `MODEL_ENCODER`, `MODEL_DECODER`, `MODEL_JOINER` and `MODEL_TOKENS` override individual paths for exports with other filenames. This selects existing files; it does not quantize or convert weights. Models are loaded once at worker startup, so changing them requires a rollout. Configure the same export on all workers.
+
+This worker requires a sherpa-onnx-compatible NeMo transducer export with token timestamps, durations and scores. It is not a general loader for Whisper, CTC or arbitrary Hugging Face models. Custom exports and FP32 have configuration tests, but have not been inference-benchmarked here. FP16, BF16 and INT4 are not claimed as working CPU presets. Do not assume they reduce latency or meet the same RAM budget. Preserve the licenses and attribution of any replacement weights.
+
 ## Queue, storage and limits
 
-Only **one API process / replica** may own the SQLite directory. A process lock catches accidental duplicate API processes. Use local block storage, not a shared SQLite file over NFS. Worker replicas never open SQLite or mount API storage.
+Only **one API process / replica** may own the queue and audio directory. A process lock catches accidental duplicate API processes. Use local block storage, not a shared SQLite file over NFS. Worker replicas never open SQLite or mount API storage.
 
 Workers receive a 90-second lease and renew it during processing. An expired lease returns the job to the queue, up to three attempts. A lease token prevents an old worker from committing after reassignment or deletion. Execution is at least once. Re-submitting the same upload with the same options returns its existing job, which makes that submission idempotent. A new upload creates a new job.
 
 | Setting | Default | Applies to |
 | --- | --- | --- |
+| `DB_MODE` | `memory`; optionally `file` | API |
 | `MAX_UPLOAD_BYTES` | 134217728, 128 MiB | API and worker; keep equal |
 | `MAX_STORAGE_BYTES` | 2147483648, 2 GiB | API uploaded-audio quota |
 | `MAX_PENDING_JOBS` | 32 queued + processing | API |
@@ -98,15 +120,17 @@ Workers receive a 90-second lease and renew it during processing. An expired lea
 | `PUBLIC_BASE_URL` | `http://localhost:8080` | Exact public origin used for opaque upload URLs |
 | `AUDIO_URL_HOSTS` | Empty | Comma-separated trusted HTTPS download origins |
 
-Reservations bound stored uploads. Two simultaneous body uploads are allowed; completed uploads release their slots while requests wait in the queue. A full queue or upload quota returns `429` with `Retry-After`. Byte and duration limits are explicit; oversized audio is rejected rather than silently truncated. The API volume also needs room for SQLite and its WAL, beyond the audio quota.
+Reservations bound stored uploads. Two simultaneous body uploads are allowed; completed uploads release their slots while requests wait in the queue. A full queue or upload quota returns `429` with `Retry-After`. Byte and duration limits are explicit; oversized audio is rejected rather than silently truncated. In file mode, the API volume also needs room for SQLite and its WAL, beyond the audio quota. In memory mode, retained transcript data counts against the API RAM limit.
 
 A cleanup task runs every 30 seconds. Unsubmitted uploads expire after at least one hour. OpenAI jobs and audio are deleted after the final result is constructed, on timeout or on disconnect. AssemblyAI jobs remain pollable for the retention period and can be deleted earlier. Deletion stops lease renewal; a worker may need to finish its current native inference window before removing its temporary copy.
 
-SQLite stores job state, leases, options and results. It is not a media archive. Use a PVC to recover jobs after Pod replacement. Use `emptyDir` instead if losing unfinished jobs and results on Pod replacement is acceptable. Worker scratch can always be `emptyDir`. Deleting rows and files is not a secure erasure guarantee for storage snapshots or backups; keep this service out of long-lived media backups.
+SQLite stores job state, leases, options and completed results for polling. With `DB_MODE=memory`, one serialized connection keeps the database in RAM; no SQLite database or journal file is written. An API process restart loses all jobs and results, including accepted jobs still being processed. Clients must resubmit; IDs from before the restart return 404 and old workers cannot commit results. Unrecoverable uploaded files are removed on API startup.
+
+For optional restart recovery, set `DB_MODE=file` and put `DATA_DIR` on a PVC. Memory mode refuses a directory containing an existing `jobs.sqlite3`, so changing the default cannot silently discard a durable queue. Existing deployments must set `DB_MODE=file` explicitly or switch to a fresh data directory. In memory mode, disk `emptyDir` holds temporary audio only. It is not RAM-only audio handling and does not promise zero writes to the host disk. Worker scratch can always be `emptyDir`. Deleting rows and files is not a secure erasure guarantee for storage snapshots or backups; keep this service out of long-lived media backups.
 
 ## Deployment
 
-`deploy/colocated.yaml` puts API and worker in one Pod. `deploy/distributed.yaml` separates them so workers can scale independently. Both use namespace `parakeet`, one API replica, a 4 GiB API PVC and disk scratch. Apply **one** variant after creating the Secret shown in `deploy/README.md`.
+`deploy/colocated.yaml` puts API and worker in one Pod. `deploy/distributed.yaml` separates them so workers can scale independently. Both use namespace `parakeet`, one API replica, in-memory SQLite and disk `emptyDir` for temporary audio. No PVC is required. Apply **one** variant after creating the Secret shown in `deploy/README.md`.
 
 Start the server with an API limit of 0.5 CPU / 512 MiB and one worker at 3.5 CPU / 6 GiB, totaling 4 CPU / 6.5 GiB. A second worker adds another model and its RAM requirement; parallel workers do not fit the same total budget automatically. On the Mac, use the smaller Compose settings for initial testing. Server latency still needs measurement on the actual CPU.
 
