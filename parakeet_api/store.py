@@ -196,7 +196,7 @@ class Store:
             unused = db.execute(
                 """SELECT id FROM uploads WHERE created<? AND
                                 NOT EXISTS(SELECT 1 FROM jobs WHERE upload_id=uploads.id)""",
-                (now - max(self.s.retention, 3600),),
+                (now - max(self.s.retention, 3700),),
             ).fetchall()
             for row in unused:
                 db.execute("DELETE FROM uploads WHERE id=?", (row[0],))
@@ -204,6 +204,11 @@ class Store:
             (self.blobs / uid).unlink(missing_ok=True)
         with self.connect() as db:
             db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            known = {row[0] for row in db.execute("SELECT id FROM uploads")}
+        # Recover files left between committing a deletion and unlinking audio.
+        for path in self.blobs.iterdir():
+            if path.name not in known and path.stat().st_mtime < now - 3700:
+                path.unlink(missing_ok=True)
 
     def counts(self):
         with self.connect() as db:

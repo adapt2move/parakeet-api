@@ -53,52 +53,9 @@ def words_from_result(result, duration_ms):
 
 
 def validate_options(options):
-    if not isinstance(options, dict):
-        raise ValueError("config must be an object")
-    allowed = {"language_code", "sample_rate", "channels", "_pcm", "timestamps"}
-    if set(options) - allowed:
-        raise ValueError("Unsupported config fields: " + ", ".join(sorted(set(options) - allowed)))
-    if "timestamps" in options and type(options["timestamps"]) is not bool:
-        raise ValueError("timestamps must be boolean")
+    # A caller label, not forced decoding or language identification.
     language = options.get("language_code")
-    if language is not None and (
-        not isinstance(language, str)
-        or language
-        not in {
-            "bg",
-            "hr",
-            "cs",
-            "da",
-            "nl",
-            "en",
-            "et",
-            "fi",
-            "fr",
-            "de",
-            "el",
-            "hu",
-            "it",
-            "lv",
-            "lt",
-            "mt",
-            "pl",
-            "pt",
-            "ro",
-            "ru",
-            "sk",
-            "sl",
-            "es",
-            "sv",
-            "uk",
-        }
-    ):
+    languages = "bg hr cs da nl en et fi fr de el hu it lv lt mt pl pt ro ru sk sl es sv uk".split()
+    if language is not None and language not in languages:
         raise ValueError("Unsupported language_code")
-    if "sample_rate" in options and (
-        type(options["sample_rate"]) is not int
-        or options["sample_rate"] not in {8000, 16000, 22050, 24000, 32000, 44100, 48000}
-    ):
-        raise ValueError("Unsupported sample_rate")
-    if "channels" in options and (type(options["channels"]) is not int or options["channels"] not in {1, 2}):
-        raise ValueError("channels must be 1 or 2")
-    # Parakeet decodes multilingually; this is a caller label, not forced decoding or language identification.
     return language

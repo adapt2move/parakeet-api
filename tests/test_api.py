@@ -94,26 +94,24 @@ def test_openai_sdk_uses_word_seconds_and_deletes_job(client, settings, result):
 
 def test_queued_requests_do_not_hold_upload_slots(client, settings, result):
     with ThreadPoolExecutor(3) as pool:
-        pending = [
-            pool.submit(
-                client.post,
-                "/v1/audio/transcriptions",
-                files={"file": ("a.wav", b"audio")},
-                data={"model": "parakeet"},
+        pending = []
+        for expected in range(1, 4):
+            pending.append(
+                pool.submit(
+                    client.post,
+                    "/v1/audio/transcriptions",
+                    files={"file": ("a.wav", b"audio")},
+                    data={"model": "parakeet"},
+                )
             )
-            for _ in range(3)
-        ]
-        for _ in range(200):
-            if client.app.state.store.counts().get("queued") == 3:
-                break
-            time.sleep(0.01)
-        # Retryable upload backpressure is allowed during concurrent body parsing;
-        # send the third after earlier requests have entered the queue below.
-        for _ in range(client.app.state.store.counts().get("queued", 0)):
+            for _ in range(200):
+                if client.app.state.store.counts().get("queued") == expected:
+                    break
+                time.sleep(0.01)
+            assert client.app.state.store.counts().get("queued") == expected
+        for _ in range(3):
             complete(client, settings, result)
-        responses = [p.result(timeout=5) for p in pending]
-        assert sum(r.status_code == 200 for r in responses) >= 2
-        assert all(r.status_code in (200, 429) for r in responses)
+        assert all(p.result(timeout=5).status_code == 200 for p in pending)
 
 
 def test_assemblyai_sdk_upload_submit_poll_and_subtitles(client, settings, result, monkeypatch):

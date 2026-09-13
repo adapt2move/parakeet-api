@@ -83,3 +83,16 @@ def test_retention_and_job_age(settings, result):
         db.execute("UPDATE jobs SET created=?", (time.time() - settings.max_job_age - 1,))
     store.cleanup()
     assert store.get(job["id"])["status"] == "error"
+
+
+def test_cleanup_removes_crash_orphans_but_preserves_recent_files(settings):
+    import os
+
+    store = Store(settings)
+    stale = store.blobs / "crash-orphan"
+    stale.write_bytes(b"audio")
+    os.utime(stale, (0, 0))
+    recent = store.blobs / "recent-upload"
+    recent.write_bytes(b"audio")
+    store.cleanup()
+    assert not stale.exists() and recent.exists()
