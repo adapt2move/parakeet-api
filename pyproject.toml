@@ -18,7 +18,7 @@ worker = [
 dev = [
     "pytest>=8,<10",
     "ruff>=0.12,<1",
-    "openai>=2,<3",
+    "openai>=3.13.0,<4",
     "assemblyai>=0.40,<1",
     "pydantic-settings>=2,<3",
 ]
