@@ -1,0 +1,7 @@
+*
+!parakeet_api
+!pyproject.toml
+!uv.lock
+!LICENSE
+!NOTICE
+!scripts/download_model.py

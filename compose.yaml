@@ -1,0 +1,48 @@
+name: parakeet
+services:
+  api:
+    image: ${API_IMAGE:-ghcr.io/adapt2move/parakeet-api:main}
+    build:
+      context: .
+      target: api
+    ports:
+      - "127.0.0.1:${API_PORT:-8080}:8080"
+    environment:
+      API_KEY: ${API_KEY:?Set API_KEY}
+      WORKER_API_KEY: ${WORKER_API_KEY:?Set WORKER_API_KEY}
+      PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:-http://localhost:8080}
+    volumes:
+      - data:/data
+    tmpfs:
+      - /tmp:size=384m,uid=10001,gid=10001
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    cpus: 0.25
+    mem_limit: 384m
+    restart: unless-stopped
+  worker:
+    image: ${WORKER_IMAGE:-ghcr.io/adapt2move/parakeet-worker:main}
+    build:
+      context: .
+      target: worker
+    # Disk-backed scratch avoids charging decoded audio against the RAM limit.
+    volumes:
+      - type: volume
+        target: /scratch
+    environment:
+      API_URL: http://api:8080
+      WORKER_API_KEY: ${WORKER_API_KEY:?Set WORKER_API_KEY}
+      PARAKEET_THREADS: "2"
+      TMPDIR: /scratch
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    cpus: 1.75
+    mem_limit: 4g
+    depends_on:
+      api:
+        condition: service_healthy
+    restart: unless-stopped
+volumes:
+  data:

@@ -1,0 +1,19 @@
+Parakeet API
+Copyright 2026 adapt2move contributors
+Application source: https://github.com/adapt2move/parakeet-api
+Licensed under the EUPL-1.2. See LICENSE.
+
+The worker image additionally contains NVIDIA Parakeet TDT 0.6B v3 model weights,
+converted to ONNX and quantized to INT8 by the sherpa-onnx project.
+Original model: https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3
+Copyright NVIDIA Corporation. Model license: CC-BY-4.0
+https://creativecommons.org/licenses/by/4.0/legalcode
+Conversion source: https://github.com/k2-fsa/sherpa-onnx
+Archive: sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8.tar.bz2
+SHA256: 5793d0fd397c5778d2cf2126994d58e9d56b1be7c04d13c7a15bb1b4eafb16bf
+Changes to weights: ONNX conversion and INT8 quantization by upstream.
+No endorsement by NVIDIA, OpenAI or AssemblyAI is implied.
+
+sherpa-onnx is licensed under Apache-2.0.
+FFmpeg and Debian packages retain their respective licenses and notices in
+/usr/share/doc. Python dependency licenses are distributed in site-packages.
