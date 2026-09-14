@@ -10,7 +10,7 @@ dependencies = ["fastapi==0.141.1", "uvicorn==0.52.4", "httpx==0.28.1"]
 [project.optional-dependencies]
 worker = [
     "sherpa-onnx==1.13.8",
-    "numpy==2.3.3",
+    "numpy==2.4.6",
     "sherpa-onnx-core==1.13.8",
 ]
 
