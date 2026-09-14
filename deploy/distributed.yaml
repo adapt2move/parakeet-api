@@ -64,8 +64,6 @@ spec:
               key: WORKER_API_KEY
         - name: PUBLIC_BASE_URL
           value: http://parakeet-api.parakeet.svc.cluster.local:8080
-        - name: DB_MODE
-          value: memory
         resources:
           requests:
             cpu: 100m
@@ -101,7 +99,7 @@ spec:
           periodSeconds: 5
           failureThreshold: 24
       volumes:
-      # Audio quota plus multipart spooling (MAX_CONCURRENT_UPLOADS x MAX_UPLOAD_BYTES).
+      # Uploaded audio, bounded by MAX_STORAGE_BYTES. The API empties it on startup.
       - name: data
         emptyDir:
           sizeLimit: 3Gi
