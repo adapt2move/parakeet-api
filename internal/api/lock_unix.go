@@ -14,7 +14,7 @@ import (
 func lockDataDir(dir string) (func(), error) {
 	f, err := os.OpenFile(filepath.Join(dir, "api.lock"), os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
 	if err != nil {
-		return nil, fmt.Errorf("open DATA_DIR lock: %w", err)
+		return nil, fmt.Errorf("open DATA_DIR lock: %s", logCause(err))
 	}
 	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
 		f.Close()

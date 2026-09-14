@@ -1,371 +1,186 @@
 package formats
 
 import (
-	"bytes"
-	"compress/gzip"
-	"crypto/sha256"
-	"encoding/base64"
-	"encoding/hex"
 	"encoding/json"
-	"errors"
-	"fmt"
-	"io"
-	"math"
-	"os"
-	"strconv"
+	"reflect"
 	"strings"
 	"testing"
 )
 
-// Fixtures come from testdata/generate.py running the Python reference implementation.
-
-func load(t *testing.T, name string, v any) {
-	t.Helper()
-	f, err := os.Open("testdata/" + name)
-	if err != nil {
-		t.Fatal(err)
+func words(spec ...any) []Word {
+	var out []Word
+	for i := 0; i < len(spec); i += 3 {
+		out = append(out, Word{Text: spec[i].(string), Start: int64(spec[i+1].(int)), End: int64(spec[i+2].(int)), Confidence: 0.5})
 	}
-	defer f.Close()
-	var r io.Reader = f
-	if strings.HasSuffix(name, ".gz") {
-		gz, err := gzip.NewReader(f)
-		if err != nil {
-			t.Fatal(err)
-		}
-		r = gz
-	}
-	if err := json.NewDecoder(r).Decode(v); err != nil {
-		t.Fatal(err)
-	}
+	return out
 }
 
-// same reports the first difference between Python's and Go's bytes.
-func same(t *testing.T, label string, want string, got []byte) {
-	t.Helper()
-	if want == string(got) {
-		return
+func TestValidate(t *testing.T) {
+	valid := func() *Result {
+		return &Result{Text: "Hello world.", Words: words("Hello", 120, 610, "world.", 900, 1700), AudioDurationMS: 2100, Chunks: 1}
 	}
-	i := 0
-	for i < len(want) && i < len(got) && want[i] == got[i] {
-		i++
-	}
-	from := max(0, i-40)
-	t.Errorf("%s differs at byte %d:\npython: %q\ngo:     %q", label, i, want[from:min(len(want), i+40)], got[from:min(len(got), i+40)])
-}
-
-type requestCase struct {
-	Name        string  `json:"name"`
-	ContentType *string `json:"content_type"`
-	Status      int     `json:"status"`
-	Body        string  `json:"body"`
-	BodyText    *string `json:"body_text"`
-	BodyB64     *string `json:"body_b64"`
-}
-
-func (c requestCase) raw(t *testing.T) []byte {
-	if c.BodyText != nil {
-		return []byte(*c.BodyText)
-	}
-	raw, err := base64.StdEncoding.DecodeString(*c.BodyB64)
-	if err != nil {
-		t.Fatal(err)
-	}
-	return raw
-}
-
-func (c requestCase) contentType() string {
-	if c.ContentType == nil {
-		return ""
-	}
-	return *c.ContentType
-}
-
-// expectError maps a Python response to the error Go must return.
-func expectError(status int, body string) error {
-	switch {
-	case status == 422:
-		return ErrInvalid
-	case status == 400 && strings.Contains(body, "There was an error parsing the body"):
-		return ErrBodyParse
-	case status == 400 && strings.Contains(body, "Provide exactly one of result or error"):
-		return ErrResultOrError
-	}
-	return nil
-}
-
-type completionCase struct {
-	requestCase
-	Stored       *string `json:"stored"`
-	StoredSHA256 string  `json:"stored_sha256"`
-	Error        *string `json:"error"`
-	Retry        bool    `json:"retry"`
-	BodySHA256   string  `json:"body_sha256"`
-	Recipe       struct {
-		Kind     string `json:"kind"`
-		UnitJSON string `json:"unit_json"`
-		Repeat   int    `json:"repeat"`
-		Count    int    `json:"count"`
-		Length   int    `json:"length"`
-		Last     int    `json:"last"`
-	} `json:"recipe"`
-}
-
-func checkCompletion(t *testing.T, c completionCase, raw []byte) {
-	t.Helper()
-	got, err := DecodeCompletion(c.contentType(), raw)
-	if c.Status != 200 {
-		want := expectError(c.Status, c.Body)
-		if want == nil {
-			t.Fatalf("%s: unexpected Python status %d %s", c.Name, c.Status, c.Body)
-		}
-		if !errors.Is(err, want) {
-			t.Errorf("%s: python %d %s, go error %v", c.Name, c.Status, c.Body, err)
-		}
-		return
-	}
-	if err != nil {
-		t.Errorf("%s: python accepted, go error %v", c.Name, err)
-		return
-	}
-	if got.Retry != c.Retry || (got.Error == nil) != (c.Error == nil) || (got.Error != nil && *got.Error != *c.Error) {
-		t.Errorf("%s: error/retry = %v/%v, python %v/%v", c.Name, got.Error, got.Retry, c.Error, c.Retry)
-	}
-	if (got.Result == nil) != (c.Stored == nil && c.StoredSHA256 == "") {
-		t.Errorf("%s: result presence differs", c.Name)
-		return
-	}
-	if got.Result == nil {
-		return
-	}
-	stored, _ := got.Result.MarshalJSON()
-	if c.Stored != nil {
-		same(t, c.Name+" stored", *c.Stored, stored)
-	} else if sum := sha256.Sum256(stored); hex.EncodeToString(sum[:]) != c.StoredSHA256 {
-		t.Errorf("%s: stored result hash differs", c.Name)
-	}
-}
-
-func TestCompletionMatchesPython(t *testing.T) {
-	var cases []completionCase
-	load(t, "completion.json", &cases)
-	for _, c := range cases {
-		checkCompletion(t, c, c.raw(t))
-	}
-}
-
-func TestLargeCompletionMatchesPython(t *testing.T) {
-	var cases []completionCase
-	load(t, "completion_large.json", &cases)
-	for _, c := range cases {
-		var b strings.Builder
-		switch c.Recipe.Kind {
-		case "word":
-			text := `"` + strings.Repeat(c.Recipe.UnitJSON, c.Recipe.Repeat) + `"`
-			fmt.Fprintf(&b, `{"result": {"text": %s, "audio_duration_ms": 1000, "chunks": 1, "seam_fallbacks": 0, "words": [{"text": %s, "start": 0, "end": 10, "confidence": 0.5}]}}`, text, text)
-		case "words":
-			texts := make([]string, c.Recipe.Count)
-			for i := range texts {
-				texts[i] = strings.Repeat("x", c.Recipe.Length)
+	long := strings.Repeat("a", MaxWordChars)
+	for _, tc := range []struct {
+		name   string
+		change func(*Result)
+		ok     bool
+	}{
+		{"valid", func(*Result) {}, true},
+		{"no words", func(r *Result) { r.Text, r.Words = "", []Word{} }, true},
+		{"equal timings", func(r *Result) { r.Words[1].Start, r.Words[1].End = 120, 610 }, true},
+		{"bounds", func(r *Result) { r.Words[0].Confidence, r.Words[1].Confidence, r.Words[1].End = 0, 1, 2100 }, true},
+		{"longest word", func(r *Result) { r.Text, r.Words = long, words(long, 0, 10) }, true},
+		{"multibyte word", func(r *Result) {
+			r.Text, r.Words = strings.Repeat("é", MaxWordChars), words(strings.Repeat("é", MaxWordChars), 0, 10)
+		}, true},
+		{"missing words", func(r *Result) { r.Text, r.Words = "", nil }, false},
+		{"text mismatch", func(r *Result) { r.Text = "Hello  world." }, false},
+		{"trailing text", func(r *Result) { r.Text += " " }, false},
+		{"empty word", func(r *Result) { r.Text, r.Words = "", words("", 0, 10) }, false},
+		{"word too long", func(r *Result) { r.Text, r.Words = long+"a", words(long+"a", 0, 10) }, false},
+		{"negative start", func(r *Result) { r.Words[0].Start = -1 }, false},
+		{"zero length", func(r *Result) { r.Words[0].End = 120 }, false},
+		{"end after audio", func(r *Result) { r.Words[1].End = 2101 }, false},
+		{"start moves back", func(r *Result) { r.Words[1].Start = 100 }, false},
+		{"end moves back", func(r *Result) { r.Words[0].End, r.Words[1].End = 1800, 1700 }, false},
+		{"confidence above one", func(r *Result) { r.Words[0].Confidence = 1.01 }, false},
+		{"negative confidence", func(r *Result) { r.Words[0].Confidence = -0.01 }, false},
+		{"speaker", func(r *Result) { r.Words[0].Speaker = "A" }, false},
+		{"channel", func(r *Result) { r.Words[0].Channel = 1.0 }, false},
+		{"zero duration", func(r *Result) { r.Text, r.Words, r.AudioDurationMS = "", []Word{}, 0 }, false},
+		{"duration above limit", func(r *Result) { r.AudioDurationMS = MaxAudioMS + 1 }, false},
+		{"zero chunks", func(r *Result) { r.Chunks = 0 }, false},
+		{"negative seam fallbacks", func(r *Result) { r.SeamFallbacks = -1 }, false},
+		{"too many words", func(r *Result) {
+			r.Words = make([]Word, MaxWords+1)
+			for i := range r.Words {
+				r.Words[i] = Word{Text: "a", Start: 0, End: 1}
 			}
-			texts[len(texts)-1] = strings.Repeat("y", c.Recipe.Last)
-			fmt.Fprintf(&b, `{"result": {"text": "%s", "audio_duration_ms": 10800000, "chunks": 1, "seam_fallbacks": 0, "words": [`, strings.Join(texts, " "))
-			for i, text := range texts {
-				if i > 0 {
-					b.WriteString(", ")
-				}
-				fmt.Fprintf(&b, `{"text": "%s", "start": %d, "end": %d, "confidence": 0.5}`, text, i*100, i*100+50)
+			r.Text = strings.TrimSpace(strings.Repeat("a ", MaxWords+1))
+		}, false},
+		{"text too long", func(r *Result) {
+			r.Words = make([]Word, MaxTextChars/MaxWordChars+1)
+			for i := range r.Words {
+				r.Words[i] = Word{Text: long, Start: 0, End: 1}
 			}
-			b.WriteString("]}}")
-		}
-		raw := []byte(b.String())
-		if sum := sha256.Sum256(raw); hex.EncodeToString(sum[:]) != c.BodySHA256 {
-			t.Fatalf("%s: rebuilt body differs from Python's", c.Name)
-		}
-		checkCompletion(t, c, raw)
-	}
-}
-
-func TestSubmissionMatchesPython(t *testing.T) {
-	var cases []struct {
-		requestCase
-		AudioURL     *string `json:"audio_url"`
-		LanguageCode *string `json:"language_code"`
-	}
-	load(t, "submission.json", &cases)
-	for _, c := range cases {
-		got, err := DecodeSubmission(c.contentType(), c.raw(t))
-		if want := expectError(c.Status, c.Body); want != nil {
-			if !errors.Is(err, want) {
-				t.Errorf("%s: python %d %s, go error %v", c.Name, c.Status, c.Body, err)
-			}
-			continue
-		}
-		if err != nil {
-			t.Errorf("%s: python accepted, go error %v", c.Name, err)
-			continue
-		}
-		// The API only forwards a non-empty language_code.
-		var language *string
-		if got.LanguageCode != nil && *got.LanguageCode != "" {
-			language = got.LanguageCode
-		}
-		if (language == nil) != (c.LanguageCode == nil) || (language != nil && *language != *c.LanguageCode) {
-			t.Errorf("%s: language %v, python %v", c.Name, language, c.LanguageCode)
-		}
-		switch {
-		case c.Status == 400 && strings.Contains(c.Body, "Invalid transcription options"):
-			if language == nil || ValidLanguage(*language) {
-				t.Errorf("%s: python rejected the language", c.Name)
-			}
-		case c.Status == 418:
-			if language != nil && !ValidLanguage(*language) {
-				t.Errorf("%s: python accepted the language", c.Name)
-			}
-			if c.AudioURL == nil || got.AudioURL != *c.AudioURL {
-				t.Errorf("%s: audio_url %q, python %v", c.Name, got.AudioURL, c.AudioURL)
-			}
-		default:
-			t.Errorf("%s: unexpected Python status %d %s", c.Name, c.Status, c.Body)
+			r.Text = strings.Join(texts(r.Words), " ")
+		}, false},
+	} {
+		r := valid()
+		tc.change(r)
+		if err := r.Validate(); (err == nil) != tc.ok {
+			t.Errorf("%s: Validate() = %v", tc.name, err)
 		}
 	}
 }
 
-func TestOutputsMatchPython(t *testing.T) {
-	var cases []struct {
-		Name string `json:"name"`
-		Job  struct {
-			ID           string  `json:"id"`
-			Status       string  `json:"status"`
-			Error        *string `json:"error"`
-			UploadID     string  `json:"upload_id"`
-			LanguageCode *string `json:"language_code"`
-			Result       *string `json:"result"`
-		} `json:"job"`
-		PublicURL string            `json:"public_url"`
-		Assembly  string            `json:"assembly"`
-		Deleted   string            `json:"deleted"`
-		OpenAI    map[string]string `json:"openai"`
-		Segments  map[string]string `json:"segments"`
-		SRT       map[string]string `json:"srt"`
-		VTT       map[string]string `json:"vtt"`
-		TextJSON  string            `json:"text_json"`
+func TestResultJSONHasNoCoercion(t *testing.T) {
+	for body, ok := range map[string]bool{
+		`{"text":"a","start":1,"end":2,"confidence":1}`:                                 true,
+		`{"text":"a","start":1,"end":2,"confidence":0.5,"speaker":null,"channel":null}`: true,
+		`{"text":"a","start":"1","end":2,"confidence":0.5}`:                             false,
+		`{"text":"a","start":1.0,"end":2,"confidence":0.5}`:                             false,
+		`{"text":"a","start":1,"end":2,"confidence":true}`:                              false,
+		`{"text":5,"start":1,"end":2,"confidence":0.5}`:                                 false,
+	} {
+		var w Word
+		if err := json.Unmarshal([]byte(body), &w); (err == nil) != ok {
+			t.Errorf("%s: %v", body, err)
+		}
 	}
-	load(t, "outputs.json.gz", &cases)
-	if len(cases) == 0 {
-		t.Fatal("no cases")
+	out, _ := json.Marshal(Word{Text: "a", Start: 1, End: 2, Confidence: 0.25})
+	if string(out) != `{"text":"a","start":1,"end":2,"confidence":0.25,"speaker":null,"channel":null}` {
+		t.Errorf("marshal: %s", out)
 	}
-	for _, c := range cases {
-		job := Job{ID: c.Job.ID, Status: c.Job.Status, Error: c.Job.Error, UploadID: c.Job.UploadID, LanguageCode: c.Job.LanguageCode}
-		if c.Job.Result != nil {
-			r, err := DecodeResult([]byte(*c.Job.Result))
-			if err != nil {
-				t.Fatalf("%s: stored result rejected: %v", c.Name, err)
-			}
-			stored, _ := r.MarshalJSON()
-			same(t, c.Name+" stored", *c.Job.Result, stored)
-			job.Result = r
+}
+
+func TestTimestamp(t *testing.T) {
+	for _, tc := range []struct {
+		ms       int64
+		srt, vtt string
+	}{
+		{0, "00:00:00,000", "00:00:00.000"},
+		{120, "00:00:00,120", "00:00:00.120"},
+		{59_999, "00:00:59,999", "00:00:59.999"},
+		{3_723_004, "01:02:03,004", "01:02:03.004"},
+		{10_800_000, "03:00:00,000", "03:00:00.000"},
+	} {
+		if got := Timestamp(tc.ms, false); got != tc.srt {
+			t.Errorf("srt %d: %s", tc.ms, got)
 		}
-		transcript := Assembly(job, c.PublicURL)
-		got, _ := transcript.MarshalJSON()
-		same(t, c.Name+" assembly", c.Assembly, got)
-		got, _ = transcript.Deleted().MarshalJSON()
-		same(t, c.Name+" deleted", c.Deleted, got)
-		if job.Result == nil {
-			continue
-		}
-		for key, want := range c.OpenAI {
-			granularities := strings.Split(key, ",")
-			if key == "" {
-				granularities = nil
-			}
-			got, _ := OpenAI(job.Result, granularities).MarshalJSON()
-			same(t, c.Name+" openai "+key, want, got)
-		}
-		for n, want := range c.Segments {
-			chars, _ := strconv.Atoi(n)
-			same(t, c.Name+" segments "+n, want, appendSegments(nil, Segments(job.Result, chars)))
-		}
-		for n, want := range c.SRT {
-			chars, _ := strconv.Atoi(n)
-			same(t, c.Name+" srt "+n, want, []byte(Subtitles(job.Result, false, chars)))
-		}
-		for n, want := range c.VTT {
-			chars, _ := strconv.Atoi(n)
-			same(t, c.Name+" vtt "+n, want, []byte(Subtitles(job.Result, true, chars)))
-		}
-		if c.TextJSON != "" {
-			same(t, c.Name+" text", c.TextJSON, TextJSON(job.Result.Text))
+		if got := Timestamp(tc.ms, true); got != tc.vtt {
+			t.Errorf("vtt %d: %s", tc.ms, got)
 		}
 	}
 }
 
-func TestEncodingMatchesPython(t *testing.T) {
-	var fixture struct {
-		Floats []struct {
-			Hex  string `json:"hex"`
-			JSON string `json:"json"`
-		} `json:"floats"`
-		Strings []struct {
-			Value string `json:"value"`
-			JSON  string `json:"json"`
-		} `json:"strings"`
-		Timestamps []struct {
-			Hex string `json:"hex"`
-			SRT string `json:"srt"`
-			VTT string `json:"vtt"`
-		} `json:"timestamps"`
-		Languages []struct {
-			Code  string `json:"code"`
-			Valid bool   `json:"valid"`
-		} `json:"languages"`
-	}
-	load(t, "encoding.json", &fixture)
-	parse := func(s string) float64 {
-		f, err := strconv.ParseFloat(s, 64)
-		if err != nil {
-			t.Fatal(err)
+func TestGroup(t *testing.T) {
+	text := func(groups [][]Word) []string {
+		var out []string
+		for _, g := range groups {
+			out = append(out, strings.Join(texts(g), " "))
 		}
-		return f
+		return out
 	}
-	for _, c := range fixture.Floats {
-		same(t, "float "+c.Hex, c.JSON, AppendFloat(nil, parse(c.Hex)))
-	}
-	for _, c := range fixture.Strings {
-		same(t, fmt.Sprintf("string %q", c.Value), c.JSON, AppendString(nil, c.Value))
-	}
-	for _, c := range fixture.Timestamps {
-		f := parse(c.Hex)
-		if got := Timestamp(f, false); got != c.SRT {
-			t.Errorf("Timestamp(%v, srt) = %s, python %s", f, got, c.SRT)
-		}
-		if got := Timestamp(f, true); got != c.VTT {
-			t.Errorf("Timestamp(%v, vtt) = %s, python %s", f, got, c.VTT)
-		}
-	}
-	for _, c := range fixture.Languages {
-		if ValidLanguage(c.Code) != c.Valid {
-			t.Errorf("ValidLanguage(%q) = %v", c.Code, !c.Valid)
+	for _, tc := range []struct {
+		name  string
+		words []Word
+		chars int
+		want  []string
+	}{
+		{"empty", nil, 80, nil},
+		{"fits", words("one", 0, 100, "two", 200, 300), 7, []string{"one two"}},
+		{"chars", words("one", 0, 100, "two", 200, 300), 6, []string{"one", "two"}},
+		{"characters not bytes", words("éé", 0, 100, "éé", 200, 300), 5, []string{"éé éé"}},
+		{"long word alone", words("a", 0, 100, "toolong", 200, 300, "b", 400, 500), 3, []string{"a", "toolong", "b"}},
+		{"span of 6 s", words("a", 0, 100, "b", 1500, 6000), 80, []string{"a b"}},
+		{"span above 6 s", words("a", 0, 100, "b", 1500, 6001), 80, []string{"a", "b"}},
+		{"gap of 1.5 s", words("a", 0, 100, "b", 1600, 1700), 80, []string{"a b"}},
+		{"gap above 1.5 s", words("a", 0, 100, "b", 1601, 1700), 80, []string{"a", "b"}},
+	} {
+		if got := text(Group(tc.words, tc.chars)); !reflect.DeepEqual(got, tc.want) {
+			t.Errorf("%s: %q", tc.name, got)
 		}
 	}
 }
 
-func TestMarshalOutputIsNotHTMLEscaped(t *testing.T) {
-	r := &Result{Text: "<a> & b", Words: []Word{{Text: "<a>", Start: 0, End: 1, Confidence: 1}, {Text: "&", Start: 1, End: 2}, {Text: "b", Start: 2, End: 3}}, AudioDurationMS: 3, Chunks: 1}
-	got, _ := Assembly(Job{ID: "id", Status: "completed", UploadID: "u", Result: r}, "http://x").MarshalJSON()
-	if !bytes.Contains(got, []byte(`"text":"<a> & b"`)) || !bytes.Contains(got, []byte(`"confidence":0.3333333333333333`)) {
-		t.Fatalf("unexpected output %s", got)
+func TestCaptions(t *testing.T) {
+	w := words("Hello", 0, 400, "a<b", 500, 1000, "&", 3000, 3500, "c>", 3_723_004, 3_723_500)
+	srt := "1\n00:00:00,000 --> 00:00:01,000\nHello a&lt;b\n\n" +
+		"2\n00:00:03,000 --> 00:00:03,500\n&amp;\n\n" +
+		"3\n01:02:03,004 --> 01:02:03,500\nc&gt;\n"
+	vtt := "WEBVTT\n\n1\n00:00:00.000 --> 00:00:01.000\nHello a&lt;b\n\n" +
+		"2\n00:00:03.000 --> 00:00:03.500\n&amp;\n\n" +
+		"3\n01:02:03.004 --> 01:02:03.500\nc&gt;\n"
+	if got := Captions(w, false, 80); got != srt {
+		t.Errorf("srt:\n%s", got)
 	}
-	if !json.Valid(got) {
-		t.Fatal("invalid JSON")
+	if got := Captions(w, true, 80); got != vtt {
+		t.Errorf("vtt:\n%s", got)
+	}
+	if got := Captions(nil, false, 80) + "|" + Captions(nil, true, 80); got != "|WEBVTT\n" {
+		t.Errorf("empty: %q", got)
 	}
 }
 
-func TestSaturatedCounts(t *testing.T) {
-	r, err := DecodeResult([]byte(`{"text": "", "words": [], "audio_duration_ms": 1, "chunks": 1e18, "seam_fallbacks": 99999999999999999999}`))
-	if err != nil {
-		t.Fatal(err)
+func TestVerbose(t *testing.T) {
+	r := &Result{Text: "Hello world. Later", Words: words("Hello", 120, 610, "world.", 900, 1700, "Later", 3300, 3500), AudioDurationMS: 3600, Chunks: 1}
+	for _, tc := range []struct {
+		words, segments bool
+		want            string
+	}{
+		{false, true, `{"task":"transcribe","duration":3.6,"text":"Hello world. Later","segments":[` +
+			`{"id":0,"start":0.12,"end":1.7,"text":"Hello world."},{"id":1,"start":3.3,"end":3.5,"text":"Later"}]}`},
+		{true, false, `{"task":"transcribe","duration":3.6,"text":"Hello world. Later","words":[` +
+			`{"word":"Hello","start":0.12,"end":0.61},{"word":"world.","start":0.9,"end":1.7},{"word":"Later","start":3.3,"end":3.5}]}`},
+	} {
+		out, _ := json.Marshal(NewVerbose(r, tc.words, tc.segments))
+		if string(out) != tc.want {
+			t.Errorf("words=%v segments=%v:\n%s", tc.words, tc.segments, out)
+		}
 	}
-	if r.Chunks != 1_000_000_000_000_000_000 || r.SeamFallbacks != math.MaxInt64 {
-		t.Fatalf("got %d %d", r.Chunks, r.SeamFallbacks)
+	empty, _ := json.Marshal(NewVerbose(&Result{Words: []Word{}, AudioDurationMS: 1000}, true, true))
+	if string(empty) != `{"task":"transcribe","duration":1,"text":"","words":[],"segments":[]}` {
+		t.Errorf("empty: %s", empty)
 	}
 }

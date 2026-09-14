@@ -18,15 +18,15 @@ import (
 )
 
 func main() {
+	if len(os.Args) == 2 && os.Args[1] == "healthcheck" {
+		os.Exit(api.Healthcheck(os.Getenv("LISTEN_ADDR")))
+	}
 	if len(os.Args) > 1 {
-		if os.Args[1] == "healthcheck" && len(os.Args) == 2 {
-			os.Exit(api.Healthcheck(os.Getenv("LISTEN_ADDR")))
-		}
 		fmt.Fprintln(os.Stderr, "usage: parakeet-api [healthcheck]")
 		os.Exit(2)
 	}
 	log := slog.New(slog.NewJSONHandler(os.Stderr, nil))
-	cfg, err := api.LoadSettings(os.LookupEnv)
+	cfg, err := api.LoadSettings(os.Getenv)
 	if err != nil {
 		log.Error("invalid_settings", "error", err.Error())
 		os.Exit(1)
@@ -35,7 +35,6 @@ func main() {
 	defer stop()
 	if err := api.Run(ctx, cfg, log); err != nil {
 		log.Error("api_failed", "error", err.Error())
-		stop()
 		os.Exit(1)
 	}
 }

@@ -1,416 +1,233 @@
 package api
 
 import (
-	"bytes"
+	"context"
 	"errors"
 	"io"
 	"net/http"
-	"net/url"
-	"strings"
+	"slices"
 	"time"
 
 	"github.com/adapt2move/parakeet-api/internal/formats"
 	"github.com/adapt2move/parakeet-api/internal/store"
 )
 
-// Form limits of the Python API: one file, ten other fields of at most 64 KiB each.
 const (
-	maxFormFiles  = 1
 	maxFormFields = 10
-	maxFieldBytes = 65536
+	maxFieldBytes = 64 << 10
 )
 
 var (
-	errUnsupportedFields = newError(http.StatusUnprocessableEntity, "Unsupported transcription fields; streaming and prompts are not supported")
-	errDuplicateField    = newError(http.StatusBadRequest, "Duplicate multipart field")
-	errUnknownModel      = newError(http.StatusBadRequest, "Unknown model; use parakeet")
-	errTemperature       = newError(http.StatusUnprocessableEntity, "Only greedy decoding is supported")
-	errResponseFormat    = newError(http.StatusBadRequest, "Invalid response format or timestamp granularity")
-	errNotAFile          = newError(http.StatusBadRequest, "file must be an audio file")
-	errSyncTimeout       = newError(http.StatusGatewayTimeout, "Transcription wait timed out; use the asynchronous /v2 API")
-
-	errMissingBoundary = newError(http.StatusBadRequest, "Missing boundary in multipart.")
-	errMissingName     = newError(http.StatusBadRequest, `The Content-Disposition header field "name" must be provided.`)
-	errTooManyFiles    = newError(http.StatusBadRequest, "Too many files. Maximum number of files is 1.")
-	errTooManyFields   = newError(http.StatusBadRequest, "Too many fields. Maximum number of fields is 10.")
-	errPartTooLarge    = newError(http.StatusBadRequest, "Part exceeded maximum size of 64KB.")
-	errFieldTooLarge   = newError(http.StatusBadRequest, "Field exceeded maximum size of 64KB.")
+	errUnsupported  = newError(http.StatusUnprocessableEntity, "Unsupported transcription fields; streaming and prompts are not supported")
+	errDuplicate    = newError(http.StatusBadRequest, "Duplicate multipart field")
+	errModel        = newError(http.StatusBadRequest, "Unknown model; use parakeet")
+	errTemperature  = newError(http.StatusUnprocessableEntity, "Only greedy decoding is supported")
+	errFormat       = newError(http.StatusBadRequest, "Invalid response format or timestamp granularity")
+	errNoFile       = newError(http.StatusBadRequest, "file must be an audio file")
+	errForm         = newError(http.StatusBadRequest, "Invalid multipart form")
+	errSyncTimeout  = newError(http.StatusGatewayTimeout, "Transcription wait timed out; use the asynchronous /v2 API")
+	errDisconnected = newError(499, "Client disconnected")
 )
 
-var allowedFields = []string{"file", "model", "language", "response_format", "timestamp_granularities[]", "temperature"}
+var (
+	formFields      = []string{"file", "model", "language", "response_format", "timestamp_granularities[]", "temperature"}
+	models          = []string{"parakeet", "parakeet-tdt-0.6b-v3", "whisper-1"}
+	responseFormats = []string{"json", "text", "verbose_json", "srt", "vtt"}
+)
 
-type formValue struct {
-	name  string
-	value string
-	file  bool // a part with a filename; value is unused
-}
-
-// form is a parsed /v1 request. The "file" part streams straight into a reserved upload.
-type form struct {
-	values  []formValue
-	upload  string // reserved upload holding the file part, if any
-	size    int64
-	saveErr error // storing the file failed; reported only after the fields validate
-}
-
-func (f *form) last(name string) (formValue, bool) {
-	for i := len(f.values) - 1; i >= 0; i-- {
-		if f.values[i].name == name {
-			return f.values[i], true
-		}
+// transcriptions runs a synchronous transcription. Its job and audio are gone when it returns.
+func (a *API) transcriptions(w http.ResponseWriter, r *http.Request) {
+	release, ok := a.acquireSlot()
+	if !ok {
+		a.fail(w, r, errSlotsFull)
+		return
 	}
-	return formValue{}, false
+	defer release()
+	fields, uploadID, err := a.readForm(r)
+	var opts transcriptionOptions
+	if err == nil {
+		opts, err = parseOptions(fields, uploadID != "")
+	}
+	var job store.Job
+	if err == nil {
+		release()
+		job, err = a.store.Submit(uploadID, opts.language)
+	}
+	if err != nil {
+		a.store.DiscardUpload(uploadID)
+		a.fail(w, r, err)
+		return
+	}
+	defer a.store.Delete(job.ID)
+	result, err := a.wait(r.Context(), job.ID)
+	if err != nil {
+		a.fail(w, r, err)
+		return
+	}
+	switch opts.format {
+	case "json":
+		writeJSON(w, http.StatusOK, map[string]string{"text": result.Text})
+	case "verbose_json":
+		writeJSON(w, http.StatusOK, formats.NewVerbose(result, opts.words, opts.segments))
+	case "text":
+		writeText(w, "text/plain; charset=utf-8", result.Text)
+	case "srt":
+		writeText(w, "text/plain; charset=utf-8", formats.Captions(result.Words, false, 80))
+	case "vtt":
+		writeText(w, "text/vtt; charset=utf-8", formats.Captions(result.Words, true, 80))
+	}
 }
 
-func (a *API) transcriptions(w http.ResponseWriter, r *http.Request, _ []string) {
-	res, err := a.transcribe(r)
-	a.reply(w, r, res, err)
-}
-
-// transcribe runs a synchronous transcription. Its job and audio are gone when it returns.
-func (a *API) transcribe(r *http.Request) (response, error) {
-	f := &form{}
-	jobID := ""
+// readForm reads a multipart form, streaming the file part into a new upload. The body is read
+// to its end so that the server notices a client that disconnects while waiting.
+func (a *API) readForm(r *http.Request) (fields map[string][]string, uploadID string, err error) {
 	defer func() {
-		if jobID != "" {
-			a.store.Delete(jobID)
-		} else if f.upload != "" {
-			a.store.DiscardUpload(f.upload)
+		if b, ok := r.Body.(*bodyReader); ok && b.err != nil {
+			err = b.err // a failing body explains any parse error
+		}
+		if err != nil {
+			a.store.DiscardUpload(uploadID)
+			uploadID = ""
 		}
 	}()
-	if err := a.readForm(r, f); err != nil {
-		return response{}, err
-	}
-	format, granularities, options, err := validateForm(f)
+	mr, err := r.MultipartReader()
 	if err != nil {
-		return response{}, err
+		return nil, "", errForm
 	}
-	if f.saveErr != nil {
-		return response{}, f.saveErr
+	fields = map[string][]string{}
+	count := 0
+	for {
+		part, err := mr.NextPart()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return nil, uploadID, errForm
+		}
+		if part.FileName() != "" {
+			if part.FormName() != "file" || uploadID != "" {
+				return nil, uploadID, errForm
+			}
+			src := &tracked{Reader: part}
+			id, err := a.store.Save(src)
+			switch {
+			case src.err != nil:
+				return nil, "", errForm
+			case err != nil:
+				return nil, "", err
+			}
+			uploadID = id
+			continue
+		}
+		count++
+		value, err := io.ReadAll(io.LimitReader(part, maxFieldBytes+1))
+		if err != nil || count > maxFormFields || len(value) > maxFieldBytes {
+			return nil, uploadID, errForm
+		}
+		fields[part.FormName()] = append(fields[part.FormName()], string(value))
 	}
-	if f.size == 0 {
-		return response{}, errAudioEmpty
+	if _, err := io.Copy(io.Discard, r.Body); err != nil {
+		return nil, uploadID, errForm
 	}
-	if err := a.store.UploadReady(f.upload, f.size); err != nil {
-		return response{}, err
-	}
-	releaseSlot(r)
-	job, err := a.store.Submit(f.upload, options)
-	if err != nil {
-		return response{}, err
-	}
-	jobID = job.ID
-	job, err = a.wait(r, job.ID)
-	if err != nil {
-		return response{}, err
-	}
-	result, err := storedResult(job)
-	if err != nil {
-		return response{}, err
-	}
-	switch format {
-	case "json":
-		return jsonResponse(formats.TextJSON(result.Text)), nil
-	case "verbose_json":
-		body, _ := formats.OpenAI(result, granularities).MarshalJSON()
-		return jsonResponse(body), nil
-	case "text":
-		return textResponse("text/plain", result.Text), nil
-	case "vtt":
-		return response{status: http.StatusOK, contentType: "text/vtt; charset=utf-8", body: formats.AppendSubtitles(nil, result, true, 80)}, nil
-	default:
-		return response{status: http.StatusOK, contentType: "text/plain; charset=utf-8", body: formats.AppendSubtitles(nil, result, false, 80)}, nil
-	}
+	return fields, uploadID, nil
 }
 
-// wait polls the job until it completes, fails, the client disconnects or the sync timeout hits.
-func (a *API) wait(r *http.Request, id string) (store.Job, error) {
-	timeout := time.NewTimer(a.cfg.SyncTimeout)
-	defer timeout.Stop()
+type transcriptionOptions struct {
+	format          string
+	words, segments bool
+	language        string
+}
+
+func parseOptions(fields map[string][]string, hasFile bool) (transcriptionOptions, error) {
+	for name := range fields {
+		if !slices.Contains(formFields, name) {
+			return transcriptionOptions{}, errUnsupported
+		}
+	}
+	for name, values := range fields {
+		if len(values) > 1 && name != "timestamp_granularities[]" {
+			return transcriptionOptions{}, errDuplicate
+		}
+	}
+	first := func(name string) (string, bool) {
+		if values := fields[name]; len(values) > 0 {
+			return values[0], true
+		}
+		return "", false
+	}
+	opts := transcriptionOptions{format: "json"}
+	if model, ok := first("model"); ok && !slices.Contains(models, model) {
+		return opts, errModel
+	}
+	if t, ok := first("temperature"); ok && t != "0" && t != "0.0" {
+		return opts, errTemperature
+	}
+	if format, ok := first("response_format"); ok {
+		opts.format = format
+	}
+	if !slices.Contains(responseFormats, opts.format) {
+		return opts, errFormat
+	}
+	for _, g := range fields["timestamp_granularities[]"] {
+		switch g {
+		case "word":
+			opts.words = true
+		case "segment":
+			opts.segments = true
+		default:
+			return opts, errFormat
+		}
+	}
+	opts.segments = opts.segments || !opts.words
+	if language, _ := first("language"); language != "" {
+		if !formats.ValidLanguage(language) {
+			return opts, errInvalidOptions
+		}
+		opts.language = language
+	}
+	if _, plain := first("file"); plain || !hasFile {
+		return opts, errNoFile
+	}
+	return opts, nil
+}
+
+// wait polls the job until it completes or fails, the client disconnects or the sync timeout hits.
+func (a *API) wait(ctx context.Context, id string) (*formats.Result, error) {
+	ctx, cancel := context.WithTimeout(ctx, a.cfg.SyncTimeout)
+	defer cancel()
 	ticker := time.NewTicker(a.poll)
 	defer ticker.Stop()
 	for {
 		job, err := a.store.Get(id)
-		if err != nil {
-			return store.Job{}, err
-		}
-		switch job.Status {
-		case store.StatusError:
-			message := ""
-			if job.Error != nil {
-				message = *job.Error
-			}
-			return store.Job{}, newError(http.StatusUnprocessableEntity, message)
-		case store.StatusCompleted:
-			return job, nil
+		switch {
+		case err != nil:
+			return nil, err
+		case job.Status == store.StatusError:
+			return nil, newError(http.StatusUnprocessableEntity, job.Error)
+		case job.Result != nil:
+			return job.Result, nil
 		}
 		select {
-		case <-r.Context().Done():
-			return store.Job{}, errDisconnected
-		case <-timeout.C:
-			return store.Job{}, errSyncTimeout
+		case <-ctx.Done():
+			if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+				return nil, errSyncTimeout
+			}
+			return nil, errDisconnected
 		case <-ticker.C:
 		}
 	}
 }
 
-func validateForm(f *form) (format string, granularities []string, options map[string]string, err error) {
-	counts := map[string]int{}
-	for _, v := range f.values {
-		if !contains(allowedFields, v.name) {
-			return "", nil, nil, errUnsupportedFields
-		}
-		counts[v.name]++
-	}
-	for name, n := range counts {
-		if name != "timestamp_granularities[]" && n != 1 {
-			return "", nil, nil, errDuplicateField
-		}
-	}
-	// A file part never equals a string, as an UploadFile never did in Python.
-	if v, ok := f.last("model"); ok && (v.file || !contains([]string{"parakeet", "parakeet-tdt-0.6b-v3", "whisper-1"}, v.value)) {
-		return "", nil, nil, errUnknownModel
-	}
-	if v, ok := f.last("temperature"); ok && (v.file || (v.value != "0" && v.value != "0.0")) {
-		return "", nil, nil, errTemperature
-	}
-	format = "json"
-	valid := true
-	if v, ok := f.last("response_format"); ok {
-		format, valid = v.value, !v.file
-	}
-	valid = valid && contains([]string{"json", "text", "verbose_json", "srt", "vtt"}, format)
-	for _, v := range f.values {
-		if v.name == "timestamp_granularities[]" {
-			valid = valid && !v.file && (v.value == "word" || v.value == "segment")
-			granularities = append(granularities, v.value)
-		}
-	}
-	if !valid {
-		return "", nil, nil, errResponseFormat
-	}
-	if len(granularities) == 0 {
-		granularities = []string{"segment"}
-	}
-	options = map[string]string{}
-	if v, ok := f.last("language"); ok && (v.file || v.value != "") {
-		if v.file || !formats.ValidLanguage(v.value) {
-			return "", nil, nil, errInvalidOptions
-		}
-		options["language_code"] = v.value
-	}
-	if v, ok := f.last("file"); !ok || !v.file {
-		return "", nil, nil, errNotAFile
-	}
-	return format, granularities, options, nil
+// tracked records the first read error, to tell failures of a source from failures to store it.
+type tracked struct {
+	io.Reader
+	err error
 }
 
-// readForm parses the body like Starlette's request.form(): multipart and urlencoded bodies are
-// read, any other content type yields an empty form without reading the body.
-func (a *API) readForm(r *http.Request, f *form) error {
-	// Starlette decoded header values as Latin-1.
-	ctype, params := parseOptionsHeader(latin1String([]byte(r.Header.Get("Content-Type"))))
-	switch ctype {
-	case "multipart/form-data":
-		boundary, ok := params["boundary"]
-		if !ok {
-			return errMissingBoundary
-		}
-		if err := a.readMultipart(r.Body, latin1Bytes(boundary), f); err != nil {
-			// A parser may hide a failure of the body behind its own error; the body's error wins.
-			if b := state(r).body; b != nil && b.err != nil {
-				return b.err
-			}
-			return err
-		}
-	case "application/x-www-form-urlencoded":
-		if err := readURLEncoded(r.Body, f); err != nil {
-			return err
-		}
-	default:
-		return nil
+func (t *tracked) Read(p []byte) (int, error) {
+	n, err := t.Reader.Read(p)
+	if err != nil && err != io.EOF && t.err == nil {
+		t.err = err
 	}
-	// Reach the end of the body so that the server notices a client that disconnects later.
-	_, err := io.Copy(io.Discard, r.Body)
-	return err
-}
-
-// receiveFile streams the file part into a new upload. Storage and size failures are kept in
-// f.saveErr so the fields can still be validated first, as Python did after spooling the form.
-// Only failures to read the part are returned.
-func (a *API) receiveFile(part io.Reader, f *form) error {
-	uid, err := a.store.Reserve()
-	if err != nil {
-		f.saveErr = err
-		_, err = io.Copy(io.Discard, part)
-		return err
-	}
-	f.upload = uid
-	f.size, err = a.writeBlob(uid, part, nil)
-	var storage *storageError
-	if errors.Is(err, errAudioTooLarge) || errors.As(err, &storage) {
-		f.saveErr = err
-		_, err = io.Copy(io.Discard, part)
-	}
-	return err
-}
-
-// readURLEncoded parses a form body like python-multipart's QuerystringParser with Starlette's
-// limits. It streams: a field fails once its name and value pass 64 KiB, and the form fails at
-// the end of its eleventh field, without buffering the rest of the body.
-func readURLEncoded(body io.Reader, f *form) error {
-	buf := make([]byte, 32*1024)
-	var field []byte
-	size, equals, fields := 0, false, 0 // size counts name and value bytes, not the first '='
-	end := func() error {
-		if len(field) == 0 {
-			return nil
-		}
-		fields++
-		if fields > maxFormFields {
-			return errTooManyFields
-		}
-		name, value, _ := bytes.Cut(field, []byte("="))
-		f.values = append(f.values, formValue{name: unquotePlus(name), value: unquotePlus(value)})
-		field, size, equals = nil, 0, false
-		return nil
-	}
-	for {
-		n, err := body.Read(buf)
-		for _, c := range buf[:n] {
-			switch {
-			case c == '&':
-				if e := end(); e != nil {
-					return e
-				}
-				continue
-			case c == '=' && !equals:
-				equals = true
-			default:
-				size++
-				if size > maxFieldBytes {
-					return errFieldTooLarge
-				}
-			}
-			field = append(field, c)
-		}
-		if err == io.EOF {
-			return end()
-		}
-		if err != nil {
-			return err
-		}
-	}
-}
-
-func unquotePlus(b []byte) string {
-	s := strings.ReplaceAll(string(b), "+", " ")
-	if decoded, err := url.PathUnescape(s); err == nil {
-		return decoded
-	}
-	return s
-}
-
-// parseOptionsHeader ports python-multipart's parse_options_header for the values the form
-// parser inspects. Without parameters the type is lowercased; with parameters it is not.
-func parseOptionsHeader(value string) (string, map[string]string) {
-	options := map[string]string{}
-	if value == "" {
-		return "", options
-	}
-	if !strings.Contains(value, ";") {
-		return strings.TrimFunc(strings.ToLower(value), pySpace), options
-	}
-	segments := parseParams(value)
-	for _, segment := range segments[1:] {
-		key, val, _ := strings.Cut(segment, "=")
-		if strings.Contains(key, "*") {
-			continue
-		}
-		if len(val) >= 2 && val[0] == '"' && val[len(val)-1] == '"' {
-			val = strings.ReplaceAll(strings.ReplaceAll(val[1:len(val)-1], `\\`, `\`), `\"`, `"`)
-		}
-		if key == "filename" && (strings.HasPrefix(safeSlice(val, 1, 3), `:\`) || strings.HasPrefix(val, `\\`)) {
-			val = val[strings.LastIndexByte(val, '\\')+1:]
-		}
-		options[key] = val
-	}
-	return segments[0], options
-}
-
-func safeSlice(s string, from, to int) string {
-	if from > len(s) {
-		return ""
-	}
-	return s[from:min(to, len(s))]
-}
-
-// parseParams ports python-multipart's _parseparam, including its quote counting.
-func parseParams(value string) []string {
-	s := ";" + value
-	var params []string
-	start := 0
-	for pyFind(s, ";", start, len(s)) == start {
-		start++
-		end := pyFind(s, ";", start, len(s))
-		ind, diff := start, 0
-		for end > 0 {
-			diff += pyCount(s, `"`, ind, end) - pyCount(s, `\"`, ind, end)
-			if diff%2 == 0 {
-				break
-			}
-			end, ind = ind, pyFind(s, ";", end+1, len(s))
-		}
-		if end < 0 {
-			end = len(s)
-		}
-		var f string
-		if i := pyFind(s, "=", start, end); i == -1 {
-			f = pySlice(s, start, end)
-		} else {
-			f = strings.ToLower(strings.TrimRightFunc(pySlice(s, start, i), pySpace)) + "=" +
-				strings.TrimLeftFunc(pySlice(s, i+1, end), pySpace)
-		}
-		params = append(params, strings.TrimFunc(f, pySpace))
-		start = end
-	}
-	return params
-}
-
-// pyIndices normalizes slice bounds like Python does for str.find, str.count and slicing.
-func pyIndices(n, start, end int) (int, int) {
-	if start < 0 {
-		start = max(start+n, 0)
-	}
-	if end < 0 {
-		end = max(end+n, 0)
-	}
-	return min(start, n), min(end, n)
-}
-
-func pySlice(s string, start, end int) string {
-	start, end = pyIndices(len(s), start, end)
-	if start >= end {
-		return ""
-	}
-	return s[start:end]
-}
-
-func pyFind(s, sub string, start, end int) int {
-	start, end = pyIndices(len(s), start, end)
-	if start > end {
-		return -1
-	}
-	if i := strings.Index(s[start:end], sub); i >= 0 {
-		return start + i
-	}
-	return -1
-}
-
-func pyCount(s, sub string, start, end int) int {
-	start, end = pyIndices(len(s), start, end)
-	if start > end {
-		return 0
-	}
-	return strings.Count(s[start:end], sub)
+	return n, err
 }
