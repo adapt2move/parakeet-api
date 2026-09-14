@@ -10,4 +10,3 @@
 !internal
 **/__pycache__
 **/*_test.go
-internal/**/testdata
