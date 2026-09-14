@@ -7,6 +7,9 @@ on:
   workflow_dispatch:
 permissions:
   contents: read
+env:
+  # Manual runs on other branches test images but never publish them.
+  PUBLISH: ${{ github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v') }}
 concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
@@ -15,12 +18,26 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
+        with:
+          go-version: '1.27'
+          # Standard library only: there is no go.sum to key a module cache on.
+          cache: false
+      - name: Go checks
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then echo "$unformatted"; exit 1; fi
+          go vet ./...
+          go test -race ./...
       - uses: astral-sh/setup-uv@d0d8abe699bfb85fec6de9f7adb5ae17292296ff # v6
         with:
           version: '0.8.22'
           python-version: '3.11'
       - run: uv sync --frozen
-      - run: uv run ruff check . && uv run ruff format --check . && uv run pytest -q
+      - name: Python worker checks
+        run: uv run ruff check . && uv run ruff format --check . && uv run pytest -q --ignore=tests/contract
+      - name: API contract suite
+        run: uv run pytest tests/contract -q
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: '24'
@@ -43,7 +60,7 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
       - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
-        if: github.event_name != 'pull_request'
+        if: env.PUBLISH == 'true'
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -76,7 +93,7 @@ jobs:
           uv sync --frozen
           uv run python scripts/smoke.py /tmp/speech.wav
       - name: Publish tested images
-        if: github.event_name != 'pull_request'
+        if: env.PUBLISH == 'true'
         env:
           ARCH: ${{ matrix.arch }}
           SHA: ${{ github.sha }}
@@ -87,7 +104,7 @@ jobs:
             docker push "$image:sha-$SHA-$ARCH"
           done
   manifests:
-    if: github.event_name != 'pull_request'
+    if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')
     needs: containers
     runs-on: ubuntu-24.04
     permissions:

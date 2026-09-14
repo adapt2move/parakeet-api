@@ -61,12 +61,10 @@ def main():
                 "--cpus",
                 "0.25",
                 "--memory",
-                "384m",
+                "256m",
                 "--read-only",
-                "--tmpfs",
-                "/data:uid=10001,gid=10001,size=512m",
-                "--tmpfs",
-                "/tmp:uid=10001,gid=10001,size=256m",
+                "-v",
+                "/data",
                 api_image,
             )
             port = docker("port", api, "8080/tcp").rsplit(":", 1)[1]

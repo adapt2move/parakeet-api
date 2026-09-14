@@ -5,3 +5,8 @@
 !LICENSE
 !NOTICE
 !scripts/download_model.py
+!go.mod
+!cmd
+!internal
+**/__pycache__
+**/*_test.go

@@ -5,7 +5,7 @@ description = "CPU Parakeet transcription with OpenAI and AssemblyAI file APIs"
 requires-python = ">=3.11,<3.13"
 license = "EUPL-1.2"
 authors = [{name = "Adapt2Move GmbH"}]
-dependencies = ["fastapi==0.141.1", "uvicorn==0.52.4", "python-multipart==0.0.32", "httpx==0.28.1"]
+dependencies = ["fastapi==0.141.1", "uvicorn==0.52.4", "httpx==0.28.1"]
 
 [project.optional-dependencies]
 worker = [

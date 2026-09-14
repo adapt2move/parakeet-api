@@ -64,22 +64,18 @@ spec:
               key: WORKER_API_KEY
         - name: PUBLIC_BASE_URL
           value: http://parakeet-api.parakeet.svc.cluster.local:8080
-        - name: DB_MODE
-          value: memory
         resources:
           requests:
-            cpu: 100m
-            memory: 128Mi
+            cpu: 50m
+            memory: 32Mi
             ephemeral-storage: 128Mi
           limits:
             cpu: 500m
-            memory: 512Mi
+            memory: 256Mi
             ephemeral-storage: 4Gi
         volumeMounts:
         - name: data
           mountPath: /data
-        - name: api-tmp
-          mountPath: /tmp
         securityContext:
           allowPrivilegeEscalation: false
           readOnlyRootFilesystem: true
@@ -155,12 +151,10 @@ spec:
           periodSeconds: 5
           failureThreshold: 60
       volumes:
+      # Uploaded audio, bounded by MAX_STORAGE_BYTES. The API empties it on startup.
       - name: data
         emptyDir:
           sizeLimit: 3Gi
-      - name: api-tmp
-        emptyDir:
-          sizeLimit: 384Mi
       - name: scratch
         emptyDir:
           sizeLimit: 2Gi

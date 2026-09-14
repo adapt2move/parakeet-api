@@ -10,17 +10,16 @@ services:
     environment:
       API_KEY: ${API_KEY:?Set API_KEY}
       WORKER_API_KEY: ${WORKER_API_KEY:?Set WORKER_API_KEY}
-      DB_MODE: ${DB_MODE:-memory}
       PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:-http://localhost:8080}
+    # Disk-backed and anonymous: uploaded audio only. The API empties it on startup.
     volumes:
-      - data:/data
-    tmpfs:
-      - /tmp:size=384m,uid=10001,gid=10001
+      - type: volume
+        target: /data
     read_only: true
     cap_drop: [ALL]
     security_opt: [no-new-privileges:true]
     cpus: 0.25
-    mem_limit: 384m
+    mem_limit: 256m
     restart: unless-stopped
   worker:
     image: ${WORKER_IMAGE:-ghcr.io/adapt2move/parakeet-worker:main}
@@ -45,5 +44,3 @@ services:
       api:
         condition: service_healthy
     restart: unless-stopped
-volumes:
-  data:

@@ -1,6 +1,6 @@
 # Parakeet API
 
-CPU transcription using NVIDIA Parakeet TDT 0.6B v3 INT8, with OpenAI and AssemblyAI file transcription endpoints. One small API owns an in-memory SQLite job queue by default. Each worker runs one model and claims jobs over HTTP. No PostgreSQL, Redis, GPU or external inference service is required.
+CPU transcription using NVIDIA Parakeet TDT 0.6B v3 INT8, with OpenAI and AssemblyAI file transcription endpoints. One small Go API keeps the job queue in memory. Each worker runs one model and claims jobs over HTTP. No database, Redis, GPU or external inference service is required.
 
 This is an initial implementation. The compatibility table below defines the supported subset. It is not a replacement for every feature of either hosted service.
 
@@ -16,9 +16,9 @@ openssl rand -hex 32
 docker compose up --build -d
 ```
 
-The API listens on `127.0.0.1:8080`. Compose limits the API to 0.25 CPU / 384 MiB and the worker to 1.75 CPU / 4 GiB. SQLite stays in API process memory. Uploaded audio uses a Docker scratch volume and is removed on API restart in memory mode. Worker scratch uses a separate disk volume. `docker compose down -v` deletes these volumes and any unfinished work.
+The API listens on `127.0.0.1:8080`. Compose limits the API to 0.25 CPU / 256 MiB and the worker to 1.75 CPU / 4 GiB. Jobs and results stay in API process memory. Uploaded audio uses an anonymous disk volume at `/data`, never a RAM-backed tmpfs. The API empties that directory on startup. Worker scratch uses a separate disk volume. `docker compose down -v` deletes these volumes. An API restart loses all queued jobs and results.
 
-For published images, use `docker compose up -d --no-build`. Images are `ghcr.io/adapt2move/parakeet-api` and `ghcr.io/adapt2move/parakeet-worker`, for Linux amd64 and arm64. CI publishes `main`, full `sha-<commit>` tags, and version tags when a `v*` Git tag is pushed. Pin a digest for deployment. Each image pair is tested with real inference before publication.
+For published images, use `docker compose up -d --no-build`. Images are `ghcr.io/adapt2move/parakeet-api` and `ghcr.io/adapt2move/parakeet-worker`, for Linux amd64 and arm64. CI publishes `main`, full `sha-<commit>` tags, and version tags when a `v*` Git tag is pushed. Pin a digest for deployment. Each image pair is tested with real inference before publication. The API image holds one static binary on a distroless base, without a shell. Its container health check runs `parakeet-api healthcheck`.
 
 ## APIs
 
@@ -70,7 +70,7 @@ Speaker diarization, forced language selection, language identification, transla
 
 ## Timestamps and long recordings
 
-FFmpeg decodes the first audio track to mono 16 kHz PCM on disk. The model processes windows of 120 seconds with 15 seconds of overlap. AssemblyAI returns overall audio duration rounded up to whole seconds for SDK compatibility; OpenAI retains fractional seconds. Word starts and ends come from the TDT decoder's token timestamps and durations. Subwords and punctuation are joined; overlapping chunks are merged using matching words and their times. A temporal fallback handles disagreements and is counted in worker logs as `seam_fallbacks`.
+FFmpeg decodes the first audio track to mono 16 kHz PCM on disk. The model processes windows of 120 seconds with 15 seconds of overlap. AssemblyAI returns overall audio duration rounded up to whole seconds for SDK compatibility; OpenAI retains fractional seconds. Word starts and ends come from the TDT decoder's token timestamps and durations. Subwords and punctuation are joined; overlapping chunks are merged using matching words and their times. When the earlier window skipped a passage right before its edge, the later window's reading of the overlap is used instead; worker logs count these as `seam_recoveries`. A temporal fallback handles disagreements without any common recognition and is counted as `seam_fallbacks`.
 
 These are acoustic decoder alignments, not independently verified forced alignments. Recognition errors and words at chunk boundaries can affect accuracy. Confidence is the mean of decoder token probabilities, not a calibrated probability of transcription correctness. Subtitle segments group those words without inventing individual word times. Segment token IDs and Whisper-specific log-probability fields are omitted.
 
@@ -97,55 +97,68 @@ This worker requires a sherpa-onnx-compatible NeMo transducer export with token 
 
 ## Queue, storage and limits
 
-Only **one API process / replica** may own the queue and audio directory. A process lock catches accidental duplicate API processes. Use local block storage, not a shared SQLite file over NFS. Worker replicas never open SQLite or mount API storage.
+Only **one API process / replica** may own the queue and audio directory. A lock file in `DATA_DIR` catches accidental duplicate API processes. Use local block storage, not NFS. Worker replicas never mount API storage.
 
-Workers receive a 90-second lease and renew it during processing. An expired lease returns the job to the queue, up to three attempts. A lease token prevents an old worker from committing after reassignment or deletion. Execution is at least once. Re-submitting the same upload with the same options returns its existing job, which makes that submission idempotent. A new upload creates a new job.
+Workers receive a 90-second lease and renew it during processing. A failed renewal is retried until the lease has certainly expired. An expired lease returns the job to the queue, up to three attempts. A lease token prevents an old worker from committing after reassignment or deletion. Execution is at least once. Re-submitting the same upload with the same options returns its existing job, which makes that submission idempotent. A new upload creates a new job.
+
+A worker retries transient API failures (network errors, `5xx`) when submitting a finished result, so inference is not repeated. `409` means the job was deleted, expired or reassigned; the worker drops it silently. Other `4xx` answers, invalid audio and time limits are permanent job errors. Unexpected worker failures return the job to the queue.
 
 | Setting | Default | Applies to |
 | --- | --- | --- |
-| `DB_MODE` | `memory`; optionally `file` | API |
-| `MAX_UPLOAD_BYTES` | 134217728, 128 MiB | API and worker; keep equal |
+| `MAX_UPLOAD_BYTES` | 134217728, 128 MiB | API; workers receive each upload's size with the job |
 | `MAX_STORAGE_BYTES` | 2147483648, 2 GiB | API uploaded-audio quota |
 | `MAX_PENDING_JOBS` | 32 queued + processing | API |
-| `RETENTION_SECONDS` | 3600 | Completed/failed jobs and audio |
+| `RETENTION_SECONDS` | 3600 | Completed/failed transcripts; their audio is deleted immediately |
 | `MAX_JOB_AGE_SECONDS` | 21600, 6 hours | Total queued + processing age |
 | `LEASE_SECONDS` / `MAX_ATTEMPTS` | 90 / 3 | API |
 | `SYNC_TIMEOUT_SECONDS` | 1800 | OpenAI request wait |
 | `MAX_AUDIO_SECONDS` | 10800, 3 hours | Worker, hard ceiling 3 hours |
-| `JOB_TIMEOUT_SECONDS` | 1800 | Worker, per inference attempt |
+| `JOB_TIMEOUT_SECONDS` | 1800 | Worker, per inference attempt; must cover `MAX_AUDIO_SECONDS` on your CPU |
 | `PARAKEET_THREADS` | 3 | CPU inference threads |
 | `WORKER_STALL_SECONDS` | 300 | Worker health / lease renewal watchdog |
+| `MAX_CONCURRENT_UPLOADS` | 2 | API request bodies received at once |
+| `UPLOAD_IDLE_SECONDS` | 15 | API; longest pause in an upload or a response write, and grace before the rate check |
+| `MIN_UPLOAD_BYTES_PER_SECOND` | 65536, 64 KiB/s | API; average rate for uploads and URL downloads |
 | `PUBLIC_BASE_URL` | `http://localhost:8080` | Exact public origin used for opaque upload URLs |
 | `AUDIO_URL_HOSTS` | Empty | Comma-separated trusted HTTPS download origins |
+| `LISTEN_ADDR` | `:8080` | API listen address; `parakeet-api healthcheck` uses its port |
+| `DATA_DIR` | `/data` | API uploaded-audio directory and process lock |
 
-Reservations bound stored uploads. Two simultaneous body uploads are allowed; completed uploads release their slots while requests wait in the queue. A full queue or upload quota returns `429` with `Retry-After`. Byte and duration limits are explicit; oversized audio is rejected rather than silently truncated. In file mode, the API volume also needs room for SQLite and its WAL, beyond the audio quota. In memory mode, retained transcript data counts against the API RAM limit.
+Reservations bound stored uploads. `MAX_CONCURRENT_UPLOADS` simultaneous body uploads are allowed; completed uploads release their slots while requests wait in the queue. An upload that pauses longer than `UPLOAD_IDLE_SECONDS`, or averages below `MIN_UPLOAD_BYTES_PER_SECOND` after that grace period, fails with `408` and frees its slot. A slow client cannot hold a slot by trickling bytes. At the default rate a 128 MiB upload may take up to about 35 minutes. Uploads stream straight to disk. Each upload reserves `MAX_UPLOAD_BYTES` of the quota while it arrives, so size the API data volume for `MAX_STORAGE_BYTES`. A full queue or upload quota returns `429` with `Retry-After`. Byte and duration limits are explicit; oversized audio is rejected rather than silently truncated. `JOB_TIMEOUT_SECONDS` ends an inference attempt permanently. Measure the real-time factor on the target CPU and raise it if the longest allowed recording cannot finish in time, especially with fewer `PARAKEET_THREADS`. Retained transcript data counts against the API RAM limit.
 
-A cleanup task runs every 30 seconds. Unsubmitted uploads expire after at least one hour. OpenAI jobs and audio are deleted after the final result is constructed, on timeout or on disconnect. AssemblyAI jobs remain pollable for the retention period and can be deleted earlier. Deletion stops lease renewal; a worker may need to finish its current native inference window before removing its temporary copy.
+A cleanup task runs every 30 seconds. Unsubmitted uploads expire after at least one hour. OpenAI jobs and audio are deleted after the final result is constructed, on timeout or on disconnect. Audio is deleted as soon as a job completes or fails; only the transcript or error remains. AssemblyAI jobs remain pollable for the retention period and can be deleted earlier. Deletion stops lease renewal; a worker may need to finish its current native inference window before removing its temporary copy.
 
-SQLite stores job state, leases, options and completed results for polling. With `DB_MODE=memory`, one serialized connection keeps the database in RAM; no SQLite database or journal file is written. An API process restart loses all jobs and results, including accepted jobs still being processed. Clients must resubmit; IDs from before the restart return 404 and old workers cannot commit results. Unrecoverable uploaded files are removed on API startup.
+The API keeps job state, leases, options and completed results in process memory. Only uploaded audio and a lock file are written to disk. The process needs about 10 MiB when idle. Each retained transcript costs roughly 120 bytes per word for `RETENTION_SECONDS` after completion; a three-hour recording is about 4 MiB. The 256 MiB limit in the manifests covers around 60 such transcripts retained at once, or the queue limit of 32 jobs with ample headroom. Raise it together with `MAX_PENDING_JOBS` or `RETENTION_SECONDS`. An API process restart loses all jobs and results, including accepted jobs still being processed. Clients must resubmit; IDs from before the restart return 404 and old workers cannot commit results. The API deletes all uploaded audio on startup. There is no durable mode.
 
-For optional restart recovery, set `DB_MODE=file` and put `DATA_DIR` on a PVC. Memory mode refuses a directory containing an existing `jobs.sqlite3`, so changing the default cannot silently discard a durable queue. Existing deployments must set `DB_MODE=file` explicitly or switch to a fresh data directory. In memory mode, disk `emptyDir` holds temporary audio only. It is not RAM-only audio handling and does not promise zero writes to the host disk. Worker scratch can always be `emptyDir`. Deleting rows and files is not a secure erasure guarantee for storage snapshots or backups; keep this service out of long-lived media backups.
+Disk `emptyDir` holds temporary audio only. It is not RAM-only audio handling and does not promise zero writes to the host disk. Worker scratch can always be `emptyDir`. Deleting jobs and files is not a secure erasure guarantee for storage snapshots or backups; keep this service out of long-lived media backups.
 
 ## Deployment
 
-`deploy/colocated.yaml` puts API and worker in one Pod. `deploy/distributed.yaml` separates them so workers can scale independently. Both use namespace `parakeet`, one API replica, in-memory SQLite and disk `emptyDir` for temporary audio. No PVC is required. Apply **one** variant after creating the Secret shown in `deploy/README.md`.
+`deploy/colocated.yaml` puts API and worker in one Pod. `deploy/distributed.yaml` separates them so workers can scale independently. Both use namespace `parakeet`, one API replica, an in-memory queue and disk `emptyDir` for temporary audio. No PVC is required. Apply **one** variant after creating the Secret shown in `deploy/README.md`.
 
-Start the server with an API limit of 0.5 CPU / 512 MiB and one worker at 3.5 CPU / 6 GiB, totaling 4 CPU / 6.5 GiB. A second worker adds another model and its RAM requirement; parallel workers do not fit the same total budget automatically. On the Mac, use the smaller Compose settings for initial testing. Server latency still needs measurement on the actual CPU.
+Start the server with an API limit of 0.5 CPU / 256 MiB and one worker at 3.5 CPU / 6 GiB, totaling 4 CPU / 6.25 GiB. The API rarely uses more than 20 MiB and a fraction of a CPU; the worker holds the model (about 1.2 GiB) plus decoded audio and grows to about 3 GiB on long recordings. A second worker adds another model and its RAM requirement; parallel workers do not fit the same total budget automatically. On the Mac, use the smaller Compose settings for initial testing. Server latency still needs measurement on the actual CPU.
 
 Keep `/internal/*` reachable only by workers. Use a ClusterIP service, TLS at your ingress, and reject `/internal/*` at that ingress if you expose the public API. Worker authentication uses its separate key. The manifests expose no external ingress. `AUDIO_URL_HOSTS` is empty by default, so clients upload files directly. Only explicitly trusted HTTPS hosts may be downloaded; redirects and ambient HTTP proxies are disabled. Treat that allowlist as trusted configuration, especially with private DNS.
 
-Run readiness/liveness checks for the API and the worker independently. API readiness means SQLite is available; it does not imply a worker is connected. Alert on queued jobs without progress, repeated `job_failed` events, worker health failures and volume capacity. Logs contain counts and durations, never recognized text or input URLs. All callers sharing the static key share access to jobs. This service provides no tenant isolation.
+Run readiness/liveness checks for the API and the worker independently. API readiness means the API serves requests and its queue responds; it does not imply a worker is connected. Alert on queued jobs without progress, repeated `job_failed` events, worker health failures and volume capacity. Logs contain counts and durations, never recognized text or input URLs. All callers sharing the static key share access to jobs. This service provides no tenant isolation.
 
 ## Development and CI
 
+The API is Go 1.27 with the standard library only, in `cmd/parakeet-api` and `internal/`. The worker is Python, in `parakeet_api/`.
+
 ```sh
+gofmt -l .
+go vet ./...
+go test -race ./...
 uv sync --frozen
 uv run ruff check .
 uv run ruff format --check .
 uv run pytest -q
 ```
 
-Unit and SDK tests cover fenced leases, concurrent claims, retry exhaustion, queue/storage limits, deletion, retention, request authentication and timing conversion. CI builds native amd64 and arm64 images and transcribes synthetic speech through both SDKs before pushing either image. No customer recordings belong in this repository or CI artifacts.
+`gofmt -l .` must print nothing. `uv run pytest -q` runs the worker tests and the black-box contract suite in `tests/contract`. The suite builds `./cmd/parakeet-api`, starts it with its own `DATA_DIR` and limits, and talks to it over TCP, so it needs Go on `PATH`. Run it alone with `uv run pytest tests/contract -q`.
+
+Go unit tests, the contract suite and SDK tests cover fenced leases, concurrent claims, retry exhaustion, queue/storage limits, deletion, retention, request authentication, response formats and timing conversion. CI builds native amd64 and arm64 images and transcribes synthetic speech through both SDKs before pushing either image. No customer recordings belong in this repository or CI artifacts.
 
 To test a local recording without printing or saving its transcript:
 
