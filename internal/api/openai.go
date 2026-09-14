@@ -37,12 +37,6 @@ var (
 
 // transcriptions runs a synchronous transcription. Its job and audio are gone when it returns.
 func (a *API) transcriptions(w http.ResponseWriter, r *http.Request) {
-	release, ok := a.acquireSlot()
-	if !ok {
-		a.fail(w, r, errSlotsFull)
-		return
-	}
-	defer release()
 	fields, uploadID, err := a.readForm(r)
 	var opts transcriptionOptions
 	if err == nil {
@@ -50,7 +44,6 @@ func (a *API) transcriptions(w http.ResponseWriter, r *http.Request) {
 	}
 	var job store.Job
 	if err == nil {
-		release()
 		job, err = a.store.Submit(uploadID, opts.language)
 	}
 	if err != nil {
@@ -195,7 +188,7 @@ func parseOptions(fields map[string][]string, hasFile bool) (transcriptionOption
 func (a *API) wait(ctx context.Context, id string) (*formats.Result, error) {
 	ctx, cancel := context.WithTimeout(ctx, a.cfg.SyncTimeout)
 	defer cancel()
-	ticker := time.NewTicker(a.poll)
+	ticker := time.NewTicker(pollInterval)
 	defer ticker.Stop()
 	for {
 		job, err := a.store.Get(id)

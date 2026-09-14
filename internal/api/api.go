@@ -2,7 +2,6 @@
 package api
 
 import (
-	"bytes"
 	"crypto/subtle"
 	"encoding/json"
 	"errors"
@@ -18,6 +17,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/adapt2move/parakeet-api/internal/formats"
 	"github.com/adapt2move/parakeet-api/internal/store"
 )
 
@@ -26,6 +26,7 @@ const (
 	completeBodyLimit = 16 << 20
 	uploadOverhead    = 64 << 10 // multipart framing and fields beyond MaxUploadBytes
 	maxTransfer       = time.Hour
+	pollInterval      = 200 * time.Millisecond // how often a synchronous /v1 request checks its job
 )
 
 // API is the HTTP handler.
@@ -36,13 +37,12 @@ type API struct {
 	mux    *http.ServeMux
 	client *http.Client
 	slots  chan struct{}
-	poll   time.Duration // how often a synchronous /v1 request checks its job
 }
 
 // New returns the handler for a store.
 func New(cfg Settings, st *store.Store, log *slog.Logger) *API {
 	a := &API{cfg: cfg, store: st, log: log, mux: http.NewServeMux(), client: downloadClient(cfg.UploadIdle),
-		slots: make(chan struct{}, cfg.UploadSlots), poll: 200 * time.Millisecond}
+		slots: make(chan struct{}, cfg.UploadSlots)}
 	for pattern, handler := range map[string]http.HandlerFunc{
 		"GET /health/live":                   a.live,
 		"GET /health/ready":                  a.ready,
@@ -65,22 +65,16 @@ func New(cfg Settings, st *store.Store, log *slog.Logger) *API {
 }
 
 // apiError is a client-safe failure. Its message never contains request data.
-type apiError struct {
-	status     int
-	message    string
-	retryAfter int // seconds; 0 omits the header
-}
-
-func (e *apiError) Error() string { return e.message }
+type apiError = store.Error
 
 func newError(status int, message string) *apiError {
-	return &apiError{status: status, message: message}
+	return &apiError{Status: status, Message: message}
 }
 
 var (
 	errUnauthorized  = newError(http.StatusUnauthorized, "Unauthorized")
 	errTooLarge      = newError(http.StatusRequestEntityTooLarge, "Request too large")
-	errSlotsFull     = &apiError{status: http.StatusTooManyRequests, message: "Upload slots full", retryAfter: 5}
+	errSlotsFull     = &apiError{Status: http.StatusTooManyRequests, Message: "Upload slots full", RetryAfter: 5}
 	errStalled       = newError(http.StatusRequestTimeout, "Upload stalled")
 	errTooSlow       = newError(http.StatusRequestTimeout, "Upload too slow")
 	errBadBody       = newError(http.StatusBadRequest, "Invalid request body")
@@ -93,10 +87,8 @@ var (
 // ServeHTTP authenticates and bounds every request before routing it.
 func (a *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	rc := http.NewResponseController(w)
-	if hasBody(r) {
-		// Bound every body read, including the discard net/http runs for a body left unread.
-		rc.SetReadDeadline(time.Now().Add(a.cfg.UploadIdle))
-	}
+	rc.SetWriteDeadline(time.Now().Add(a.cfg.UploadIdle))
+	w = &deadlineWriter{ResponseWriter: w, rc: rc, idle: a.cfg.UploadIdle}
 	internal := strings.HasPrefix(r.URL.Path, "/internal/")
 	if r.URL.Path != "/health/live" && r.URL.Path != "/health/ready" {
 		key := a.cfg.APIKey
@@ -109,8 +101,9 @@ func (a *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	upload := r.Method == http.MethodPost && (r.URL.Path == "/v2/upload" || r.URL.Path == "/v1/audio/transcriptions")
 	limit := int64(generalBodyLimit)
-	if isUpload(r) {
+	if upload {
 		limit = a.cfg.MaxUploadBytes + uploadOverhead
 	} else if internal && strings.HasSuffix(r.URL.Path, "/complete") {
 		limit = completeBodyLimit
@@ -119,8 +112,20 @@ func (a *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		a.fail(w, r, errTooLarge)
 		return
 	}
-	if hasBody(r) {
-		r.Body = &bodyReader{src: http.MaxBytesReader(w, r.Body, limit), rc: rc, idle: a.cfg.UploadIdle,
+	// An upload holds a slot until its body is read or the request ends.
+	release := func() {}
+	if upload {
+		select {
+		case a.slots <- struct{}{}:
+			release = sync.OnceFunc(func() { <-a.slots })
+			defer release()
+		default:
+			a.fail(w, r, errSlotsFull)
+			return
+		}
+	}
+	if r.ContentLength != 0 {
+		r.Body = &bodyReader{src: http.MaxBytesReader(w, r.Body, limit), rc: rc, idle: a.cfg.UploadIdle, done: release,
 			pace: pace{start: time.Now(), idle: a.cfg.UploadIdle, rate: a.cfg.UploadRate}}
 	}
 	// The mux answers unknown paths with text and non-canonical paths with redirects.
@@ -128,25 +133,26 @@ func (a *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		w = &unmatched{ResponseWriter: w, a: a, r: r}
 	}
 	a.mux.ServeHTTP(w, r)
-}
-
-func isUpload(r *http.Request) bool {
-	return r.Method == http.MethodPost && (r.URL.Path == "/v2/upload" || r.URL.Path == "/v1/audio/transcriptions")
-}
-
-func hasBody(r *http.Request) bool {
-	return r.Body != nil && r.Body != http.NoBody && r.ContentLength != 0
-}
-
-// acquireSlot takes an upload slot. The returned release may be called more than once.
-func (a *API) acquireSlot() (release func(), ok bool) {
-	select {
-	case a.slots <- struct{}{}:
-		return sync.OnceFunc(func() { <-a.slots }), true
-	default:
-		return nil, false
+	if b, ok := r.Body.(*bodyReader); ok && !b.eof {
+		// Close the connection instead of waiting for a body that no handler read.
+		rc.SetReadDeadline(time.Now())
 	}
 }
+
+// deadlineWriter gives each write the idle time to reach the client, so that a client that
+// stops reading cannot hold a handler.
+type deadlineWriter struct {
+	http.ResponseWriter
+	rc   *http.ResponseController
+	idle time.Duration
+}
+
+func (d *deadlineWriter) Write(p []byte) (int, error) {
+	d.rc.SetWriteDeadline(time.Now().Add(d.idle))
+	return d.ResponseWriter.Write(p)
+}
+
+func (d *deadlineWriter) Unwrap() http.ResponseWriter { return d.ResponseWriter }
 
 // unmatched turns the plain text 404 and 405 answers of the mux into JSON errors, and its
 // redirects into 404 errors.
@@ -178,35 +184,24 @@ func (u *unmatched) Write(p []byte) (int, error) {
 // fail writes the error response. When the body was not read to its end, the connection is
 // closed instead of waiting for a body the client may never finish.
 func (a *API) fail(w http.ResponseWriter, r *http.Request, err error) {
-	e := asAPIError(err)
-	if e == errInternal {
+	e, ok := errors.AsType[*apiError](err)
+	if !ok {
 		a.log.Error("request_failed", "method", r.Method, "route", r.Pattern, "error", logCause(err))
+		e = errInternal
 	}
-	if b, ok := r.Body.(*bodyReader); hasBody(r) && !(ok && b.eof) {
+	if b, ok := r.Body.(*bodyReader); r.ContentLength != 0 && !(ok && b.eof) {
 		w.Header().Set("Connection", "close")
 		http.NewResponseController(w).SetReadDeadline(time.Now())
 	}
-	if e.retryAfter > 0 {
-		w.Header().Set("Retry-After", strconv.Itoa(e.retryAfter))
+	if e.RetryAfter > 0 {
+		w.Header().Set("Retry-After", strconv.Itoa(e.RetryAfter))
 	}
-	var body any = map[string]string{"error": e.message}
+	var body any = map[string]string{"error": e.Message}
 	if strings.HasPrefix(r.URL.Path, "/v1/") {
 		body = map[string]any{"error": map[string]string{
-			"message": e.message, "type": "invalid_request_error", "code": strconv.Itoa(e.status)}}
+			"message": e.Message, "type": "invalid_request_error", "code": strconv.Itoa(e.Status)}}
 	}
-	writeJSON(w, e.status, body)
-}
-
-func asAPIError(err error) *apiError {
-	var ae *apiError
-	var se *store.Error
-	switch {
-	case errors.As(err, &ae):
-		return ae
-	case errors.As(err, &se):
-		return &apiError{status: se.Status, message: se.Message, retryAfter: se.RetryAfter}
-	}
-	return errInternal
+	writeJSON(w, e.Status, body)
 }
 
 // logCause describes an internal error without the paths and URLs error strings carry.
@@ -235,15 +230,13 @@ func writeText(w http.ResponseWriter, contentType, text string) {
 	io.WriteString(w, text)
 }
 
-// decodeJSON reads exactly one JSON value into v, rejecting unknown fields.
-func decodeJSON(r *http.Request, v any) error {
+// decodeJSON reads the body as one JSON object into v, as formats.DecodeObject describes.
+func decodeJSON(r *http.Request, v any, required, optional []string) error {
 	data, err := io.ReadAll(r.Body)
 	if err != nil {
 		return err
 	}
-	dec := json.NewDecoder(bytes.NewReader(data))
-	dec.DisallowUnknownFields()
-	if dec.Decode(v) != nil || dec.Decode(&struct{}{}) != io.EOF {
+	if formats.DecodeObject(data, v, required, optional) != nil {
 		return errInvalidFields
 	}
 	return nil
@@ -265,12 +258,13 @@ func (p *pace) add(n int) bool {
 	return elapsed <= maxTransfer && (late <= 0 || float64(p.bytes) >= late.Seconds()*float64(p.rate))
 }
 
-// bodyReader enforces the body size limit, the per-read idle deadline and the pace. Its errors
-// are *apiError values and stick.
+// bodyReader enforces the body size limit, the per-read idle deadline and the pace, and calls
+// done at the end of the body. Its errors are *apiError values and stick.
 type bodyReader struct {
 	src  io.ReadCloser
 	rc   *http.ResponseController
 	idle time.Duration
+	done func()
 	pace pace
 	err  error
 	eof  bool
@@ -297,6 +291,7 @@ func (b *bodyReader) Read(p []byte) (int, error) {
 		b.err = errTooSlow
 	case err == io.EOF:
 		b.eof = true
+		b.done()
 		// The server now watches the connection for a disconnect; that read must not time out.
 		b.rc.SetReadDeadline(time.Time{})
 	}

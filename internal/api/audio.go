@@ -7,10 +7,10 @@ import (
 	"net"
 	"net/http"
 	"net/url"
-	"regexp"
 	"slices"
 	"strings"
 	"time"
+	"uuid"
 
 	"github.com/adapt2move/parakeet-api/internal/store"
 )
@@ -22,8 +22,6 @@ var (
 	errDownloadFailed   = newError(http.StatusBadRequest, "Audio download failed")
 )
 
-var uuidPattern = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
-
 // resolveAudio returns the upload for an audio_url: one of this server's upload URLs, or a new
 // upload downloaded from a trusted host, which the caller then owns.
 func (a *API) resolveAudio(ctx context.Context, raw string) (uploadID string, owned bool, err error) {
@@ -31,7 +29,7 @@ func (a *API) resolveAudio(ctx context.Context, raw string) (uploadID string, ow
 		return "", false, errInvalidAudioURL
 	}
 	if id, ok := strings.CutPrefix(raw, a.cfg.PublicURL+"/uploads/"); ok {
-		if !uuidPattern.MatchString(id) {
+		if u, err := uuid.Parse(id); err != nil || u.String() != id {
 			return "", false, errInvalidUploadURL
 		}
 		return id, false, nil

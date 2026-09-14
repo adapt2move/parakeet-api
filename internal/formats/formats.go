@@ -35,8 +35,8 @@ func Group(words []Word, maxChars int) [][]Word {
 	return groups
 }
 
-// Timestamp formats milliseconds as HH:MM:SS,mmm (SRT) or HH:MM:SS.mmm (VTT).
-func Timestamp(ms int64, vtt bool) string {
+// timestamp formats milliseconds as HH:MM:SS,mmm (SRT) or HH:MM:SS.mmm (VTT).
+func timestamp(ms int64, vtt bool) string {
 	separator := ","
 	if vtt {
 		separator = "."
@@ -56,8 +56,8 @@ func Captions(words []Word, vtt bool, maxChars int) string {
 		if i > 0 || vtt {
 			b.WriteByte('\n')
 		}
-		fmt.Fprintf(&b, "%d\n%s --> %s\n%s\n", i+1, Timestamp(group[0].Start, vtt),
-			Timestamp(group[len(group)-1].End, vtt), cueEscaper.Replace(strings.Join(texts(group), " ")))
+		fmt.Fprintf(&b, "%d\n%s --> %s\n%s\n", i+1, timestamp(group[0].Start, vtt),
+			timestamp(group[len(group)-1].End, vtt), cueEscaper.Replace(strings.Join(texts(group), " ")))
 	}
 	return b.String()
 }

@@ -117,7 +117,7 @@ A worker retries transient API failures (network errors, `5xx`) when submitting 
 | `PARAKEET_THREADS` | 3 | CPU inference threads |
 | `WORKER_STALL_SECONDS` | 300 | Worker health / lease renewal watchdog |
 | `MAX_CONCURRENT_UPLOADS` | 2 | API request bodies received at once |
-| `UPLOAD_IDLE_SECONDS` | 15 | API; longest pause in an upload, and grace before the rate check |
+| `UPLOAD_IDLE_SECONDS` | 15 | API; longest pause in an upload or a response write, and grace before the rate check |
 | `MIN_UPLOAD_BYTES_PER_SECOND` | 65536, 64 KiB/s | API; average rate for uploads and URL downloads |
 | `PUBLIC_BASE_URL` | `http://localhost:8080` | Exact public origin used for opaque upload URLs |
 | `AUDIO_URL_HOSTS` | Empty | Comma-separated trusted HTTPS download origins |

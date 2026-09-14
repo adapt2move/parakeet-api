@@ -6,7 +6,6 @@
 package store
 
 import (
-	"crypto/rand"
 	"crypto/subtle"
 	"errors"
 	"fmt"
@@ -16,6 +15,7 @@ import (
 	"path/filepath"
 	"sync"
 	"time"
+	"uuid"
 
 	"github.com/adapt2move/parakeet-api/internal/formats"
 )
@@ -130,17 +130,11 @@ func New(cfg Config) (*Store, error) {
 		cfg.Now = time.Now
 	}
 	blobs := filepath.Join(cfg.DataDir, "audio")
+	if err := os.RemoveAll(blobs); err != nil {
+		return nil, fmt.Errorf("wipe audio directory: %w", err)
+	}
 	if err := os.MkdirAll(blobs, 0o700); err != nil {
 		return nil, fmt.Errorf("create audio directory: %w", err)
-	}
-	entries, err := os.ReadDir(blobs)
-	for _, entry := range entries {
-		if err == nil {
-			err = os.RemoveAll(filepath.Join(blobs, entry.Name()))
-		}
-	}
-	if err != nil {
-		return nil, fmt.Errorf("wipe audio directory: %w", err)
 	}
 	return &Store{cfg: cfg, blobs: blobs, uploads: map[string]*upload{}, jobs: map[string]*job{}, counts: map[Status]int{}}, nil
 }
@@ -156,7 +150,7 @@ func (s *Store) Save(src io.Reader) (string, error) {
 	s.used += s.cfg.MaxUploadBytes
 	s.mu.Unlock()
 
-	id := newUUID()
+	id := uuid.NewV4().String()
 	size, err := s.write(id, src)
 	switch {
 	case err != nil:
@@ -220,7 +214,7 @@ func (s *Store) Submit(uploadID, language string) (Job, error) {
 		return Job{}, errQueueFull
 	}
 	s.seq++
-	j := &job{Job: Job{ID: newUUID(), UploadID: u.id, Language: language}, seq: s.seq, upload: u, created: now}
+	j := &job{Job: Job{ID: uuid.NewV4().String(), UploadID: u.id, Language: language}, seq: s.seq, upload: u, created: now}
 	u.job = j
 	s.jobs[j.ID] = j
 	s.setStatus(j, StatusQueued)
@@ -259,7 +253,7 @@ func (s *Store) Claim() *Claim {
 		return nil
 	}
 	s.setStatus(next, StatusProcessing)
-	next.token, next.lease = newUUID(), now.Add(s.cfg.Lease)
+	next.token, next.lease = uuid.NewV4().String(), now.Add(s.cfg.Lease)
 	next.attempts++
 	options := map[string]string{}
 	if next.Language != "" {
@@ -318,17 +312,18 @@ func (s *Store) Finish(id, token string, result *formats.Result, message string,
 	return nil
 }
 
-// Delete removes a job, its upload and its audio. A worker holding the lease is fenced out.
-func (s *Store) Delete(id string) error {
+// Delete removes a job, its upload and its audio, and returns the job as it was. A worker
+// holding the lease is fenced out.
+func (s *Store) Delete(id string) (Job, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	j := s.jobs[id]
 	if j == nil {
-		return errJobGone
+		return Job{}, errJobGone
 	}
 	s.removeJob(j)
 	os.Remove(s.path(j.UploadID))
-	return nil
+	return j.Job, nil
 }
 
 // Cleanup fails jobs older than MaxJobAge, drops finished jobs untouched for Retention and
@@ -360,17 +355,17 @@ func (s *Store) Cleanup() error {
 	if err != nil {
 		return fmt.Errorf("read audio directory: %w", err)
 	}
-	var errs []error
+	var failed error
 	for _, entry := range entries {
 		info, err := entry.Info()
 		if known[entry.Name()] || err != nil || now.Sub(info.ModTime()) <= staleAge {
 			continue
 		}
 		if err := os.Remove(filepath.Join(s.blobs, entry.Name())); err != nil && !errors.Is(err, os.ErrNotExist) {
-			errs = append(errs, errors.New("remove orphaned audio file failed"))
+			failed = errors.New("remove orphaned audio file failed")
 		}
 	}
-	return errors.Join(errs...)
+	return failed
 }
 
 // Counts returns the number of jobs per status, omitting empty statuses.
@@ -429,13 +424,4 @@ func (s *Store) removeJob(j *job) {
 func (s *Store) removeUpload(u *upload) {
 	s.used -= u.bytes
 	delete(s.uploads, u.id)
-}
-
-// newUUID returns a random version 4 UUID in canonical lowercase form.
-func newUUID() string {
-	var b [16]byte
-	rand.Read(b[:])
-	b[6] = b[6]&0x0f | 0x40
-	b[8] = b[8]&0x3f | 0x80
-	return fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:])
 }

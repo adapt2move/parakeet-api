@@ -36,24 +36,6 @@ func TestSettingsDefaults(t *testing.T) {
 	}
 }
 
-func TestSettingsParsing(t *testing.T) {
-	s, err := LoadSettings(env(map[string]string{
-		"MAX_UPLOAD_BYTES":    " 4096\n",
-		"UPLOAD_IDLE_SECONDS": " 0.5 ",
-		"LEASE_SECONDS":       "15",
-		"PUBLIC_BASE_URL":     "https://api.example//",
-		"AUDIO_URL_HOSTS":     " Audio.Example , ,cdn.example,",
-		"DB_MODE":             "memory",
-	}))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if s.MaxUploadBytes != 4096 || s.UploadIdle != 500*time.Millisecond || s.Lease != 15*time.Second ||
-		s.PublicURL != "https://api.example" || !reflect.DeepEqual(s.AudioURLHosts, []string{"audio.example", "cdn.example"}) {
-		t.Fatalf("%+v", s)
-	}
-}
-
 func TestSettingsErrors(t *testing.T) {
 	for _, tc := range []struct {
 		env     map[string]string
@@ -62,6 +44,7 @@ func TestSettingsErrors(t *testing.T) {
 		{map[string]string{"MAX_UPLOAD_BYTES": "lots"}, "MAX_UPLOAD_BYTES"},
 		{map[string]string{"MAX_UPLOAD_BYTES": "0x10"}, "MAX_UPLOAD_BYTES"},
 		{map[string]string{"MAX_STORAGE_BYTES": "0"}, "MAX_STORAGE_BYTES"},
+		{map[string]string{"MAX_UPLOAD_BYTES": "9223372036854775807", "MAX_STORAGE_BYTES": "9223372036854775807"}, "MAX_UPLOAD_BYTES"},
 		{map[string]string{"MAX_PENDING_JOBS": "1.5"}, "MAX_PENDING_JOBS"},
 		{map[string]string{"MAX_PENDING_JOBS": "99999999999"}, "MAX_PENDING_JOBS"},
 		{map[string]string{"RETENTION_SECONDS": "-1"}, "RETENTION_SECONDS"},

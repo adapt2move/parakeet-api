@@ -14,24 +14,20 @@ import (
 
 // Settings is the process configuration, read from the environment.
 type Settings struct {
-	DataDir         string
-	APIKey          string
-	WorkerKey       string
-	PublicURL       string // without trailing slashes
-	MaxUploadBytes  int64
-	MaxStorageBytes int64
-	MaxPendingJobs  int
-	Retention       time.Duration
-	MaxJobAge       time.Duration
-	Lease           time.Duration
-	MaxAttempts     int
-	SyncTimeout     time.Duration
-	UploadSlots     int
-	UploadIdle      time.Duration
-	UploadRate      int64 // minimum average bytes per second once UploadIdle has passed
-	AudioURLHosts   []string
-	ListenAddr      string
+	store.Config
+	APIKey        string
+	WorkerKey     string
+	PublicURL     string // without trailing slashes
+	SyncTimeout   time.Duration
+	UploadSlots   int
+	UploadIdle    time.Duration // also bounds each response write
+	UploadRate    int64         // minimum average bytes per second once UploadIdle has passed
+	AudioURLHosts []string
+	ListenAddr    string
 }
+
+// maxBytes caps the byte limits, so that sums of limits and sizes cannot overflow.
+const maxBytes = 1 << 50
 
 // LoadSettings reads and validates the settings. getenv is os.Getenv outside tests; empty values
 // mean the default.
@@ -45,8 +41,8 @@ func LoadSettings(getenv func(string) string) (Settings, error) {
 		APIKey:          p.str("API_KEY", ""),
 		WorkerKey:       p.str("WORKER_API_KEY", ""),
 		PublicURL:       strings.TrimRight(p.str("PUBLIC_BASE_URL", "http://localhost:8080"), "/"),
-		MaxUploadBytes:  p.int("MAX_UPLOAD_BYTES", 128<<20, math.MaxInt64),
-		MaxStorageBytes: p.int("MAX_STORAGE_BYTES", 2<<30, math.MaxInt64),
+		MaxUploadBytes:  p.int("MAX_UPLOAD_BYTES", 128<<20, maxBytes),
+		MaxStorageBytes: p.int("MAX_STORAGE_BYTES", 2<<30, maxBytes),
 		MaxPendingJobs:  int(p.int("MAX_PENDING_JOBS", 32, math.MaxInt32)),
 		Retention:       p.seconds("RETENTION_SECONDS", 3600),
 		MaxJobAge:       p.seconds("MAX_JOB_AGE_SECONDS", 21600),
@@ -79,20 +75,6 @@ func LoadSettings(getenv func(string) string) (Settings, error) {
 		return Settings{}, errors.New("LEASE_SECONDS must be at least 15")
 	}
 	return s, nil
-}
-
-// StoreConfig returns the queue limits for store.New.
-func (s Settings) StoreConfig() store.Config {
-	return store.Config{
-		DataDir:         s.DataDir,
-		MaxUploadBytes:  s.MaxUploadBytes,
-		MaxStorageBytes: s.MaxStorageBytes,
-		MaxPendingJobs:  s.MaxPendingJobs,
-		Retention:       s.Retention,
-		MaxJobAge:       s.MaxJobAge,
-		Lease:           s.Lease,
-		MaxAttempts:     s.MaxAttempts,
-	}
 }
 
 // parser reads variables and keeps the first error. Messages name the variable, never its value.

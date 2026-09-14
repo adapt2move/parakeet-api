@@ -258,10 +258,10 @@ func TestDelete(t *testing.T) {
 	s, _ := newStore(t, nil)
 	job := queue(t, s, "")
 	claim := s.Claim()
-	if err := s.Delete(job.ID); err != nil || files(t, s) != 0 || s.used != 0 || s.Counts()["processing"] != 0 {
-		t.Fatalf("delete: %v", err)
+	if got, err := s.Delete(job.ID); err != nil || got.Status != StatusProcessing || files(t, s) != 0 || s.used != 0 || s.Counts()["processing"] != 0 {
+		t.Fatalf("delete: %+v %v", got, err)
 	}
-	if s.Heartbeat(job.ID, claim.Token) != errLease || s.Delete(job.ID) != errJobGone {
+	if _, err := s.Delete(job.ID); s.Heartbeat(job.ID, claim.Token) != errLease || err != errJobGone {
 		t.Fatal("deleted job still reachable")
 	}
 }

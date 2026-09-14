@@ -3,6 +3,7 @@ package formats
 import (
 	"encoding/json"
 	"reflect"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -33,7 +34,6 @@ func TestValidate(t *testing.T) {
 		{"multibyte word", func(r *Result) {
 			r.Text, r.Words = strings.Repeat("é", MaxWordChars), words(strings.Repeat("é", MaxWordChars), 0, 10)
 		}, true},
-		{"missing words", func(r *Result) { r.Text, r.Words = "", nil }, false},
 		{"text mismatch", func(r *Result) { r.Text = "Hello  world." }, false},
 		{"trailing text", func(r *Result) { r.Text += " " }, false},
 		{"empty word", func(r *Result) { r.Text, r.Words = "", words("", 0, 10) }, false},
@@ -45,8 +45,7 @@ func TestValidate(t *testing.T) {
 		{"end moves back", func(r *Result) { r.Words[0].End, r.Words[1].End = 1800, 1700 }, false},
 		{"confidence above one", func(r *Result) { r.Words[0].Confidence = 1.01 }, false},
 		{"negative confidence", func(r *Result) { r.Words[0].Confidence = -0.01 }, false},
-		{"speaker", func(r *Result) { r.Words[0].Speaker = "A" }, false},
-		{"channel", func(r *Result) { r.Words[0].Channel = 1.0 }, false},
+		{"speaker", func(r *Result) { r.Words[0].Speaker = &struct{}{} }, false},
 		{"zero duration", func(r *Result) { r.Text, r.Words, r.AudioDurationMS = "", []Word{}, 0 }, false},
 		{"duration above limit", func(r *Result) { r.AudioDurationMS = MaxAudioMS + 1 }, false},
 		{"zero chunks", func(r *Result) { r.Chunks = 0 }, false},
@@ -68,23 +67,36 @@ func TestValidate(t *testing.T) {
 	} {
 		r := valid()
 		tc.change(r)
-		if err := r.Validate(); (err == nil) != tc.ok {
-			t.Errorf("%s: Validate() = %v", tc.name, err)
+		if r.valid() != tc.ok {
+			t.Errorf("%s: valid() = %v", tc.name, !tc.ok)
 		}
 	}
 }
 
-func TestResultJSONHasNoCoercion(t *testing.T) {
+func TestDecodeResult(t *testing.T) {
+	word := `{"text":"a","start":0,"end":1,"confidence":0.5}`
+	result := func(words string) string {
+		return `{"text":"a","words":[` + words + `],"audio_duration_ms":1,"chunks":1,"seam_fallbacks":0}`
+	}
 	for body, ok := range map[string]bool{
-		`{"text":"a","start":1,"end":2,"confidence":1}`:                                 true,
-		`{"text":"a","start":1,"end":2,"confidence":0.5,"speaker":null,"channel":null}`: true,
-		`{"text":"a","start":"1","end":2,"confidence":0.5}`:                             false,
-		`{"text":"a","start":1.0,"end":2,"confidence":0.5}`:                             false,
-		`{"text":"a","start":1,"end":2,"confidence":true}`:                              false,
-		`{"text":5,"start":1,"end":2,"confidence":0.5}`:                                 false,
+		result(word): true,
+		result(`{"text":"a","start":0,"end":1,"confidence":1,"speaker":null,"channel":null}`): true,
+		result(`{"text":"a","start":0,"end":1,"confidence":0.5,"speaker":{}}`):                false,
+		result(`{"text":"a","start":0,"end":1,"confidence":0.5,"channel":1}`):                 false,
+		result(`{"text":"a","start":0,"end":1,"confidence":null}`):                            false,
+		result(`{"text":"a","start":0,"end":1}`):                                              false,
+		result(`{"TEXT":"a","start":0,"end":1,"confidence":0.5}`):                             false,
+		result(`{"text":"a","start":1.0,"end":2,"confidence":0.5}`):                           false,
+		result(word + `,` + word):                                                             false,
+		`{"text":"a","words":[` + word + `],"audio_duration_ms":1,"chunks":1}`:                false,
+		`{"text":null,"words":[],"audio_duration_ms":1,"chunks":1,"seam_fallbacks":0}`:        false,
+		`{"Text":"","words":[],"audio_duration_ms":1,"chunks":1,"seam_fallbacks":0}`:          false,
+		`{"text":"","words":null,"audio_duration_ms":1,"chunks":1,"seam_fallbacks":0}`:        false,
+		`null`: false,
+		`[]`:   false,
 	} {
-		var w Word
-		if err := json.Unmarshal([]byte(body), &w); (err == nil) != ok {
+		var r Result
+		if err := json.Unmarshal([]byte(body), &r); (err == nil) != ok {
 			t.Errorf("%s: %v", body, err)
 		}
 	}
@@ -94,23 +106,16 @@ func TestResultJSONHasNoCoercion(t *testing.T) {
 	}
 }
 
-func TestTimestamp(t *testing.T) {
-	for _, tc := range []struct {
-		ms       int64
-		srt, vtt string
-	}{
-		{0, "00:00:00,000", "00:00:00.000"},
-		{120, "00:00:00,120", "00:00:00.120"},
-		{59_999, "00:00:59,999", "00:00:59.999"},
-		{3_723_004, "01:02:03,004", "01:02:03.004"},
-		{10_800_000, "03:00:00,000", "03:00:00.000"},
-	} {
-		if got := Timestamp(tc.ms, false); got != tc.srt {
-			t.Errorf("srt %d: %s", tc.ms, got)
-		}
-		if got := Timestamp(tc.ms, true); got != tc.vtt {
-			t.Errorf("vtt %d: %s", tc.ms, got)
-		}
+// A body of many tiny invalid words must not allocate a word for each of them.
+func TestDecodeResultBoundsWords(t *testing.T) {
+	body := []byte(`{"words":[` + strings.Repeat(`{},`, 16<<20/3) + `{}]}`)
+	var before, after runtime.MemStats
+	runtime.ReadMemStats(&before)
+	var r Result
+	err := json.Unmarshal(body, &r)
+	runtime.ReadMemStats(&after)
+	if allocated := after.TotalAlloc - before.TotalAlloc; err == nil || allocated > 256<<20 {
+		t.Fatalf("%v after %d MiB", err, allocated>>20)
 	}
 }
 

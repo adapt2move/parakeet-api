@@ -7,6 +7,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"time"
 	"unicode/utf8"
 
 	"github.com/adapt2move/parakeet-api/internal/formats"
@@ -40,48 +41,33 @@ func (a *API) metrics(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *API) upload(w http.ResponseWriter, r *http.Request) {
-	release, ok := a.acquireSlot()
-	if !ok {
-		a.fail(w, r, errSlotsFull)
-		return
-	}
-	defer release()
 	id, err := a.store.Save(r.Body)
 	if err != nil {
 		a.fail(w, r, err)
 		return
 	}
-	release()
 	writeJSON(w, http.StatusOK, map[string]string{"upload_url": a.cfg.PublicURL + "/uploads/" + id})
 }
 
 func (a *API) submit(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		AudioURL     *string `json:"audio_url"`
-		LanguageCode *string `json:"language_code"`
+		AudioURL     string `json:"audio_url"`
+		LanguageCode string `json:"language_code"` // empty means unset
 	}
-	if err := decodeJSON(r, &req); err != nil {
+	if err := decodeJSON(r, &req, []string{"audio_url"}, []string{"language_code"}); err != nil {
 		a.fail(w, r, err)
 		return
 	}
-	if req.AudioURL == nil {
-		a.fail(w, r, errInvalidFields)
+	if req.LanguageCode != "" && !formats.ValidLanguage(req.LanguageCode) {
+		a.fail(w, r, errInvalidOptions)
 		return
 	}
-	language := ""
-	if req.LanguageCode != nil && *req.LanguageCode != "" {
-		if !formats.ValidLanguage(*req.LanguageCode) {
-			a.fail(w, r, errInvalidOptions)
-			return
-		}
-		language = *req.LanguageCode
-	}
-	uploadID, owned, err := a.resolveAudio(r.Context(), *req.AudioURL)
+	uploadID, owned, err := a.resolveAudio(r.Context(), req.AudioURL)
 	if err != nil {
 		a.fail(w, r, err)
 		return
 	}
-	job, err := a.store.Submit(uploadID, language)
+	job, err := a.store.Submit(uploadID, req.LanguageCode)
 	if err != nil {
 		if owned {
 			a.store.DiscardUpload(uploadID)
@@ -140,10 +126,7 @@ func (a *API) get(w http.ResponseWriter, r *http.Request) {
 
 // delete answers with the transcript as AssemblyAI does: completed, with text and words removed.
 func (a *API) delete(w http.ResponseWriter, r *http.Request) {
-	job, err := a.store.Get(r.PathValue("id"))
-	if err == nil {
-		err = a.store.Delete(job.ID)
-	}
+	job, err := a.store.Delete(r.PathValue("id"))
 	if err != nil {
 		a.fail(w, r, err)
 		return
@@ -220,13 +203,8 @@ func (a *API) audio(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer f.Close()
-	info, err := f.Stat()
-	if err != nil {
-		a.fail(w, r, err)
-		return
-	}
 	w.Header().Set("Content-Type", "application/octet-stream")
-	http.ServeContent(w, r, "", info.ModTime(), f)
+	http.ServeContent(w, r, "", time.Time{}, f)
 }
 
 func (a *API) complete(w http.ResponseWriter, r *http.Request) {
@@ -235,10 +213,10 @@ func (a *API) complete(w http.ResponseWriter, r *http.Request) {
 		Error  *string         `json:"error"`
 		Retry  bool            `json:"retry"`
 	}
-	err := decodeJSON(r, &req)
+	err := decodeJSON(r, &req, nil, []string{"result", "error", "retry"})
 	switch {
 	case err != nil:
-	case req.Result != nil && req.Result.Validate() != nil, req.Error != nil && utf8.RuneCountInString(*req.Error) > 200:
+	case req.Error != nil && utf8.RuneCountInString(*req.Error) > 200:
 		err = errInvalidFields
 	case (req.Result == nil) == (req.Error == nil):
 		err = errResultOrError

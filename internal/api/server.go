@@ -27,7 +27,7 @@ func Run(ctx context.Context, cfg Settings, log *slog.Logger) error {
 		return err
 	}
 	defer unlock()
-	st, err := store.New(cfg.StoreConfig())
+	st, err := store.New(cfg.Config)
 	if err != nil {
 		return errors.New(logCause(err))
 	}
@@ -36,13 +36,7 @@ func Run(ctx context.Context, cfg Settings, log *slog.Logger) error {
 		return err
 	}
 	a := New(cfg, st, log)
-	server := &http.Server{
-		Handler:           a,
-		ReadHeaderTimeout: 15 * time.Second,
-		IdleTimeout:       60 * time.Second,
-		MaxHeaderBytes:    64 << 10,
-		ErrorLog:          slog.NewLogLogger(log.Handler(), slog.LevelWarn),
-	}
+	server := a.server()
 
 	janitorCtx, stopJanitor := context.WithCancel(context.Background())
 	var janitor sync.WaitGroup
@@ -70,6 +64,18 @@ func Run(ctx context.Context, cfg Settings, log *slog.Logger) error {
 	}
 	log.Info("api_stopped")
 	return nil
+}
+
+func (a *API) server() *http.Server {
+	return &http.Server{
+		Handler:           a,
+		ReadHeaderTimeout: 15 * time.Second,
+		IdleTimeout:       60 * time.Second,
+		MaxHeaderBytes:    64 << 10,
+		// The built-in handler for "OPTIONS *" would read its body without any deadline.
+		DisableGeneralOptionsHandler: true,
+		ErrorLog:                     slog.NewLogLogger(a.log.Handler(), slog.LevelWarn),
+	}
 }
 
 // janitor applies the retention and age limits right away and then every 30 seconds.
