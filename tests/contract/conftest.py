@@ -8,22 +8,14 @@ import subprocess
 
 import pytest
 
-from .support import PROXIES, ROOT, SERVER, Launcher, sample_result
+from .support import PROXIES, ROOT, Launcher, sample_result
 
 
 @pytest.fixture(scope="session")
-def server_command(tmp_path_factory):
-    """Returns a function mapping a port to the argv that serves the API on it."""
-    if SERVER != "go":
-        raise pytest.UsageError("API_SERVER must be go; the Python API was removed")
+def launcher(tmp_path_factory):
     binary = tmp_path_factory.mktemp("go-build") / "parakeet-api"
     subprocess.run(["go", "build", "-o", str(binary), "./cmd/parakeet-api"], cwd=ROOT, check=True)
-    return lambda port: [str(binary)]
-
-
-@pytest.fixture(scope="session")
-def launcher(server_command, tmp_path_factory):
-    return Launcher(server_command, tmp_path_factory)
+    return Launcher(str(binary), tmp_path_factory)
 
 
 @pytest.fixture(scope="module")

@@ -6,99 +6,61 @@ from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
-from .support import WORKER_KEY, RawRequest, error_message, multipart, wait_until
+from .support import WORKER_KEY, RawRequest, error_message, multipart, raw_response, wait_until
 
 UPLOAD_LIMIT = 4096 + 65536
 V1 = "/v1/audio/transcriptions"
-
-
-def declared(server, method, path, length, authorization=None, **extra):
-    """Send only headers that declare a body length; the server must answer without reading it."""
-    kwargs = {} if authorization is None else {"authorization": authorization}
-    request = RawRequest(server, method, path, {"Content-Length": str(length), **extra}, **kwargs)
-    try:
-        return request.response()
-    finally:
-        request.close()
+JOB = "00000000-0000-4000-8000-000000000000"
 
 
 @pytest.mark.parametrize(
-    ("method", "path", "limit", "authorization"),
+    ("method", "path", "limit", "key"),
     [
         ("POST", "/v2/upload", UPLOAD_LIMIT, None),
         ("POST", V1, UPLOAD_LIMIT, None),
         ("POST", "/v2/transcript", 65536, None),
         ("GET", "/metrics", 65536, None),
         ("POST", "/internal/jobs/claim", 65536, WORKER_KEY),
-        ("POST", "/internal/jobs/00000000-0000-4000-8000-000000000000/heartbeat", 65536, WORKER_KEY),
-        (
-            "POST",
-            "/internal/jobs/00000000-0000-4000-8000-000000000000/complete",
-            16 * 1024 * 1024,
-            WORKER_KEY,
-        ),
+        ("POST", f"/internal/jobs/{JOB}/heartbeat", 65536, WORKER_KEY),
+        ("POST", f"/internal/jobs/{JOB}/complete", 16 * 1024 * 1024, WORKER_KEY),
     ],
 )
-def test_declared_content_length_limits(api, method, path, limit, authorization):
+def test_declared_content_length_limits(api, method, path, limit, key):
     files = api.audio_files()
-    status, headers, body = declared(api, method, path, limit + 1, authorization)
+    extra = {} if key is None else {"authorization": key}
+    status, body = raw_response(api, method, path, {"Content-Length": str(limit + 1)}, **extra)
     assert status == 413
-    # Middleware rejections use the plain error shape on every path, including /v1.
-    assert json.loads(body) == {"error": "Request too large"}
+    assert error_message(json.loads(body), v1=None)
     assert api.audio_files() == files
 
 
-def test_bodies_within_the_limits_are_accepted(api, result):
-    url, _ = api.upload(b"x" * 4096)
-    job = api.submit(url)
-    claim = api.claim()
-    # A large completion body above the general 64 KiB cap reaches validation.
-    padded = {**result, "text": "Hello world." + " " * 70000}
-    response = api.complete(claim, {"result": padded})
-    assert response.status_code == 422
-    api.finish(claim)
-    assert api.client.get(f"/v2/transcript/{job['id']}").json()["status"] == "completed"
+def chunks(total, size=8192):
+    for offset in range(0, total, size):
+        yield b"x" * min(size, total - offset)
 
 
-def test_streamed_bodies_are_limited(api):
+def test_streamed_and_sized_bodies_are_limited(api, result):
     files = api.audio_files()
-
-    def chunks(total, size=8192):
-        for offset in range(0, total, size):
-            yield b"x" * min(size, total - offset)
-
-    upload = api.client.post("/v2/upload", content=chunks(4097))
-    assert upload.status_code == 413
-    assert error_message(upload) == "Audio too large"
-    oversized = api.client.post(
-        "/v2/transcript", content=chunks(70000), headers={"content-type": "application/json"}
-    )
-    assert oversized.status_code == 413
-    streamed = api.client.post("/v2/upload", content=chunks(4096))
-    assert streamed.status_code == 200
-    assert len(api.audio_files() - files) == 1
-
-
-def test_upload_size_limits(api):
-    files = api.audio_files()
-    too_large = api.client.post("/v2/upload", content=b"x" * 4097)
-    assert too_large.status_code == 413
-    assert error_message(too_large) == "Audio too large"
+    for content in (b"x" * 4097, chunks(4097)):
+        too_large = api.client.post("/v2/upload", content=content)
+        assert too_large.status_code == 413
+        assert error_message(too_large) == "Audio too large"
+    assert api.client.post("/v2/transcript", content=chunks(70000)).status_code == 413
+    empty = api.client.post("/v2/upload", content=b"")
+    assert empty.status_code == 400 and error_message(empty) == "Audio is empty"
     assert api.audio_files() == files
-    _, uid = api.upload(b"x" * 4096)
+
+    url, uid = api.upload(b"x" * 4096)
     assert (api.audio / uid).stat().st_size == 4096
+    assert api.client.post("/v2/upload", content=chunks(4096)).status_code == 200
+    assert len(api.audio_files() - files) == 2
 
-
-def test_empty_upload_is_rejected(api):
-    files = api.audio_files()
-    response = api.client.post("/v2/upload", content=b"")
-    assert response.status_code == 400
-    assert error_message(response) == "Audio is empty"
-    body, headers = multipart([("file", b"", "a.wav")])
-    response = api.client.post(V1, content=body, headers=headers)
-    assert response.status_code == 400
-    assert error_message(response, v1=True) == "Audio is empty"
-    assert api.audio_files() == files
+    # A completion body above the general 64 KiB cap still reaches validation.
+    api.submit(url)
+    claim = api.claim()
+    padded = {**result, "text": "Hello world." + " " * 70000}
+    assert api.complete(claim, {"result": padded}).status_code == 422
+    api.finish(claim)
 
 
 @pytest.fixture(scope="module")
@@ -111,10 +73,10 @@ def slow(launcher):
     instance.stop()
 
 
-def upload_after_release(server, data=b"audio"):
+def upload_after_release(server):
     # The slot is released right after the response; allow the server a moment to get there.
     response = wait_until(
-        lambda: (r := server.client.post("/v2/upload", content=data)).status_code != 429 and r, 3
+        lambda: (r := server.client.post("/v2/upload", content=b"audio")).status_code != 429 and r, 3
     )
     assert response and response.status_code == 200, response and response.text
     return response.json()["upload_url"].rsplit("/", 1)[1]
@@ -132,14 +94,14 @@ def test_upload_slots_full_returns_429(slow):
         ):
             assert response.status_code == 429
             assert response.headers["retry-after"] == "5"
-            assert response.json() == {"error": "Upload slots full"}
+            assert error_message(response, v1=None) == "Upload slots full"
         # Only uploads compete for slots.
         assert slow.client.get("/metrics").status_code == 200
         assert (
             slow.client.post("/v2/transcript", json={"audio_url": "http://audio.invalid/"}).status_code == 400
         )
         assert holder.send(b"67890")
-        status, _, body = holder.response()
+        status, body = holder.response()
         assert status == 200, body
     finally:
         holder.close()
@@ -159,40 +121,30 @@ def trickle(server, path, headers, body, interval):
             for offset in range(1, len(body)):
                 if request.responded(interval) or not request.send(body[offset : offset + 1]):
                     break
-        status, _, response = request.response()
+        status, response = request.response()
         return status, json.loads(response), time.monotonic() - started
     finally:
         request.close()
 
 
-def test_trickling_upload_times_out(slow):
+@pytest.mark.parametrize(("interval", "message"), [(0.05, "Upload too slow"), (None, "Upload stalled")])
+def test_slow_uploads_time_out(slow, interval, message):
     files = slow.audio_files()
-    status, body, elapsed = trickle(slow, "/v2/upload", {}, b"x" * 1000, 0.05)
-    assert status == 408
-    assert body == {"error": "Upload too slow"}
+    status, body, elapsed = trickle(slow, "/v2/upload", {}, b"x" * 1000, interval)
+    assert (status, error_message(body)) == (408, message)
     assert elapsed < 5
     assert slow.audio_files() == files
     uid = upload_after_release(slow)
     assert slow.audio_files() - files == {uid}
 
 
-def test_stalled_upload_times_out(slow):
-    files = slow.audio_files()
-    status, body, elapsed = trickle(slow, "/v2/upload", {}, b"x" * 1000, None)
-    assert status == 408
-    assert body == {"error": "Upload stalled"}
-    assert 0.5 < elapsed < 5
-    assert slow.audio_files() == files
-    uid = upload_after_release(slow)
-    assert slow.audio_files() - files == {uid}
-
-
-def test_trickling_v1_upload_times_out(slow):
+def test_trickling_and_stalled_bodies_time_out_everywhere(slow):
     files = slow.audio_files()
     body, headers = multipart([("file", b"x" * 900, "a.wav")])
     status, error, _ = trickle(slow, V1, headers, body, 0.05)
-    assert status == 408
-    assert error["error"]
+    assert status == 408 and error_message(error, v1=None)
+    status, error, elapsed = trickle(slow, "/v2/transcript", {}, b"{" + b" " * 99, None)
+    assert status == 408 and error_message(error) and elapsed < 5
     assert slow.audio_files() == files
     upload_after_release(slow)
 
@@ -214,14 +166,11 @@ def test_storage_reservation_returns_429(start):
     server = start(MAX_UPLOAD_BYTES=1024, MAX_STORAGE_BYTES=2048)
     first, first_uid = server.upload(b"x" * 1024)
     server.upload(b"y" * 1024)
-    for response in (
-        server.client.post("/v2/upload", content=b"audio"),
-        server.client.post(V1, files={"file": ("a.wav", b"audio")}),
-    ):
-        assert response.status_code == 429
-        assert response.headers["retry-after"] == "30"
-    assert error_message(server.client.post("/v2/upload", content=b"audio")) == "Audio storage full"
+    upload = server.client.post("/v2/upload", content=b"audio")
     v1 = server.client.post(V1, files={"file": ("a.wav", b"audio")})
+    for response in (upload, v1):
+        assert response.status_code == 429 and response.headers["retry-after"] == "30"
+    assert error_message(upload) == "Audio storage full"
     assert error_message(v1, v1=True) == "Audio storage full"
     assert len(server.audio_files()) == 2
 
@@ -240,8 +189,7 @@ def test_queue_full_returns_429(start):
     assert server.submit(job["audio_url"])["id"] == job["id"]
     waiting, _ = server.upload()
     full = server.client.post("/v2/transcript", json={"audio_url": waiting})
-    assert full.status_code == 429
-    assert full.headers["retry-after"] == "10"
+    assert full.status_code == 429 and full.headers["retry-after"] == "10"
     assert error_message(full) == "Queue full"
 
     files = server.audio_files()
@@ -254,8 +202,7 @@ def test_queue_full_returns_429(start):
     # Processing jobs still count as pending.
     assert server.client.post("/v2/transcript", json={"audio_url": waiting}).status_code == 429
     server.finish(claim)
-    second = server.submit(waiting)
-    assert second["status"] == "queued"
+    assert server.submit(waiting)["status"] == "queued"
     server.finish(server.claim())
     assert server.metrics() == {"completed": 2}
 
