@@ -5,7 +5,7 @@ import sqlite3
 import threading
 import time
 import uuid
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 
 from fastapi import HTTPException
 
@@ -130,6 +130,7 @@ class Store:
 
     def claim(self):
         now = time.time()
+        claimed = None
         with self.connect() as db:
             db.execute("BEGIN IMMEDIATE")
             db.execute(
@@ -138,20 +139,43 @@ class Store:
                        token=NULL,lease=NULL,updated=? WHERE status='processing' AND lease<=?""",
                 (self.s.attempts, self.s.attempts, now, now),
             )
-            row = db.execute("SELECT * FROM jobs WHERE status='queued' ORDER BY created LIMIT 1").fetchone()
-            if not row:
-                return None
-            token = str(uuid.uuid4())
-            db.execute(
-                "UPDATE jobs SET status='processing',token=?,lease=?,attempts=attempts+1,updated=? WHERE id=?",
-                (token, now + self.s.lease, now, row["id"]),
+            finished = self.release_audio(db)
+            row = db.execute(
+                """SELECT jobs.*, uploads.bytes FROM jobs JOIN uploads ON uploads.id=jobs.upload_id
+                       WHERE status='queued' ORDER BY jobs.created LIMIT 1"""
+            ).fetchone()
+            if row:
+                token = str(uuid.uuid4())
+                db.execute(
+                    "UPDATE jobs SET status='processing',token=?,lease=?,attempts=attempts+1,updated=? WHERE id=?",
+                    (token, now + self.s.lease, now, row["id"]),
+                )
+                claimed = {
+                    "id": row["id"],
+                    "token": token,
+                    "lease_seconds": self.s.lease,
+                    "bytes": row["bytes"],
+                    "options": json.loads(row["options"]),
+                }
+        self.unlink(finished)
+        return claimed
+
+    def release_audio(self, db):
+        # Finished jobs never read audio again. Their upload rows stay, so submit remains idempotent.
+        ids = [
+            row[0]
+            for row in db.execute(
+                """SELECT uploads.id FROM uploads JOIN jobs ON jobs.upload_id=uploads.id
+                       WHERE jobs.status IN ('completed','error') AND uploads.bytes>0"""
             )
-            return {
-                "id": row["id"],
-                "token": token,
-                "lease_seconds": self.s.lease,
-                "options": json.loads(row["options"]),
-            }
+        ]
+        db.executemany("UPDATE uploads SET bytes=0 WHERE id=?", [(uid,) for uid in ids])
+        return ids
+
+    def unlink(self, ids):
+        # Only after commit: a crash in between leaves a file that cleanup removes later.
+        for uid in ids:
+            (self.blobs / uid).unlink(missing_ok=True)
 
     def fenced(self, db, jid, token):
         row = db.execute(
@@ -171,15 +195,19 @@ class Store:
     def audio(self, jid, token):
         with self.connect() as db:
             row = self.fenced(db, jid, token)
-            return self.blobs / row["upload_id"]
+        path = self.blobs / row["upload_id"]
+        if not path.is_file():
+            raise HTTPException(409, "Audio no longer available")
+        return path
 
     def finish(self, jid, token, result=None, error=None, retry=False):
         with self.connect() as db:
             db.execute("BEGIN IMMEDIATE")
             row = self.fenced(db, jid, token)
-            status = (
-                "queued" if retry and row["attempts"] < self.s.attempts else "error" if error else "completed"
-            )
+            if result is not None:
+                status = "completed"
+            else:
+                status = "queued" if retry and row["attempts"] < self.s.attempts else "error"
             db.execute(
                 "UPDATE jobs SET status=?,result=?,error=?,updated=?,token=NULL,lease=NULL WHERE id=?",
                 (
@@ -190,7 +218,8 @@ class Store:
                     jid,
                 ),
             )
-        # Keep upload until job expiry: retries of submit stay idempotent.
+            finished = self.release_audio(db)
+        self.unlink(finished)
 
     def delete(self, jid):
         with self.connect() as db:
@@ -211,6 +240,7 @@ class Store:
                        WHERE status IN ('queued','processing') AND created<?""",
                 (now, now - self.s.max_job_age),
             )
+            finished = self.release_audio(db)
             expired = db.execute(
                 "SELECT id,upload_id FROM jobs WHERE status IN ('completed','error') AND updated<?",
                 (now - self.s.retention,),
@@ -225,15 +255,16 @@ class Store:
             ).fetchall()
             for row in unused:
                 db.execute("DELETE FROM uploads WHERE id=?", (row[0],))
-        for uid in [r[1] for r in expired] + [r[0] for r in unused]:
-            (self.blobs / uid).unlink(missing_ok=True)
+        self.unlink(finished + [r[1] for r in expired] + [r[0] for r in unused])
         with self.connect() as db:
             db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-            known = {row[0] for row in db.execute("SELECT id FROM uploads")}
+            # Finished uploads have bytes=0; their audio file is no longer needed.
+            known = {row[0] for row in db.execute("SELECT id FROM uploads WHERE bytes>0")}
         # Recover files left between committing a deletion and unlinking audio.
         for path in self.blobs.iterdir():
-            if path.name not in known and path.stat().st_mtime < now - 3700:
-                path.unlink(missing_ok=True)
+            with suppress(FileNotFoundError):
+                if path.name not in known and path.stat().st_mtime < now - 3700:
+                    path.unlink()
 
     def counts(self):
         with self.connect() as db:

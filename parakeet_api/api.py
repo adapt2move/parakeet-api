@@ -5,6 +5,9 @@ import fcntl
 import hmac
 import json
 import logging
+import shutil
+import tempfile
+import time
 import uuid
 from contextlib import asynccontextmanager, suppress
 from urllib.parse import urlsplit
@@ -37,6 +40,22 @@ class Completion(BaseModel):
     retry: bool = False
 
 
+class Pace:
+    """Reject transfers whose average rate stays too low once the idle allowance is spent.
+
+    An idle timeout alone lets a client hold an upload slot by trickling one byte at a time.
+    """
+
+    def __init__(self, settings):
+        self.s, self.started, self.bytes = settings, time.monotonic(), 0
+
+    def add(self, size):
+        self.bytes += size
+        late = time.monotonic() - self.started - self.s.upload_idle
+        if late > 0 and self.bytes < late * self.s.upload_rate:
+            raise HTTPException(408, "Upload too slow")
+
+
 def create_app(settings=None):
     s = settings or Settings()
 
@@ -47,6 +66,12 @@ def create_app(settings=None):
         # Fail fast on accidentally running multiple uvicorn/API processes.
         with (s.data / "api.lock").open("w") as lock:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            # Multipart bodies spool to the data volume instead of a RAM-backed /tmp.
+            # This process owns the directory, so files left by a crash are removed.
+            spool = s.data / "tmp"
+            shutil.rmtree(spool, ignore_errors=True)
+            spool.mkdir()
+            previous, tempfile.tempdir = tempfile.tempdir, str(spool)
             app.state.store = Store(s)
 
             async def janitor():
@@ -65,6 +90,7 @@ def create_app(settings=None):
                 with suppress(asyncio.CancelledError):
                     await task
                 app.state.store.close()
+                tempfile.tempdir = previous
 
     app = FastAPI(title="Parakeet API", version="0.1.0", lifespan=lifespan, docs_url=None, redoc_url=None)
 
@@ -92,7 +118,7 @@ def create_app(settings=None):
             if length and (not length.isdigit() or int(length) > limit):
                 return await JSONResponse({"error": "Request too large"}, 413)(scope, receive, send)
             # Bound multipart spooling separately from the persistent audio quota.
-            if upload and self.uploads >= 2:
+            if upload and self.uploads >= s.upload_slots:
                 return await JSONResponse({"error": "Upload slots full"}, 429, headers={"Retry-After": "5"})(
                     scope, receive, send
                 )
@@ -107,23 +133,37 @@ def create_app(settings=None):
                     released = True
 
             scope["release_upload_slot"] = release_upload
+            pace = Pace(s)
             received = 0
+            responded = False
 
             async def bounded():
                 nonlocal received
                 try:
-                    async with asyncio.timeout(60):
+                    async with asyncio.timeout(s.upload_idle):
                         message = await receive()
                 except TimeoutError:
                     raise HTTPException(408, "Upload stalled") from None
-                received += len(message.get("body", b""))
+                size = len(message.get("body", b""))
+                received += size
                 if received > limit:
                     raise HTTPException(413, "Request too large")
+                if message["type"] == "http.request":
+                    pace.add(size)
                 return message
+
+            async def tracked(message):
+                nonlocal responded
+                responded = responded or message["type"] == "http.response.start"
+                await send(message)
 
             try:
                 async with asyncio.timeout(s.sync_timeout + 3600):
-                    await self.app(scope, bounded, send)
+                    await self.app(scope, bounded, tracked)
+            except TimeoutError:
+                if responded:
+                    raise
+                await JSONResponse({"error": "Request timed out"}, 504)(scope, receive, send)
             finally:
                 release_upload()
 
@@ -150,26 +190,39 @@ def create_app(settings=None):
     def store():
         return app.state.store
 
+    async def blocking(method, *args):
+        # SQLite shares a lock with the cleanup thread; never wait for it on the event loop.
+        # Cleanup after errors stays synchronous so cancellation cannot skip it.
+        return await anyio.to_thread.run_sync(method, *args)
+
     async def save(chunks):
-        uid = store().reserve()
+        uid = await blocking(store().reserve)
         size = 0
+        pace = Pace(s)
         try:
-            async with asyncio.timeout(3600):
-                async with await anyio.open_file(store().blobs / uid, "wb") as target:
-                    async for chunk in chunks:
-                        size += len(chunk)
-                        if size > s.max_bytes:
-                            raise HTTPException(413, "Audio too large")
-                        await target.write(chunk)
+            try:
+                async with asyncio.timeout(3600):
+                    async with await anyio.open_file(store().blobs / uid, "wb") as target:
+                        async for chunk in chunks:
+                            size += len(chunk)
+                            if size > s.max_bytes:
+                                raise HTTPException(413, "Audio too large")
+                            pace.add(len(chunk))
+                            await target.write(chunk)
+            except TimeoutError:
+                raise HTTPException(408, "Audio transfer timed out") from None
             if size == 0:
                 raise HTTPException(400, "Audio is empty")
-            store().upload_ready(uid, size)
+            await blocking(store().upload_ready, uid, size)
             return uid
         except BaseException:
             store().discard_upload(uid)
             raise
 
     async def resolve_audio(url):
+        # urlsplit silently drops tabs and newlines; httpx rejects other control characters.
+        if not url.isascii() or not url.isprintable() or " " in url:
+            raise HTTPException(400, "Invalid audio URL")
         prefix = f"{s.public_url}/uploads/"
         if url.startswith(prefix):
             value = url[len(prefix) :]
@@ -191,12 +244,14 @@ def create_app(settings=None):
         ):
             raise HTTPException(400, "Upload audio first, or configure a trusted AUDIO_URL_HOSTS origin")
         try:
-            async with httpx.AsyncClient(timeout=60, follow_redirects=False, trust_env=False) as client:
+            async with httpx.AsyncClient(
+                timeout=s.upload_idle, follow_redirects=False, trust_env=False
+            ) as client:
                 async with client.stream("GET", url) as response:
                     if response.status_code != 200:
                         raise HTTPException(400, "Audio download failed")
                     return await save(response.aiter_bytes()), True
-        except httpx.HTTPError:
+        except (httpx.HTTPError, httpx.InvalidURL):
             raise HTTPException(400, "Audio download failed") from None
 
     @app.get("/health/live")
@@ -205,14 +260,13 @@ def create_app(settings=None):
 
     @app.get("/health/ready")
     async def ready():
-        store().counts()
+        await blocking(store().counts)
         return {"status": "ok"}
 
     @app.get("/metrics")
     async def metrics():
-        return PlainTextResponse(
-            "".join(f'parakeet_jobs{{status="{k}"}} {v}\n' for k, v in store().counts().items())
-        )
+        counts = await blocking(store().counts)
+        return PlainTextResponse("".join(f'parakeet_jobs{{status="{k}"}} {v}\n' for k, v in counts.items()))
 
     @app.post("/v2/upload")
     async def upload(request: Request):
@@ -226,7 +280,7 @@ def create_app(settings=None):
         validate_options(options)
         uid, owned = await resolve_audio(body.audio_url)
         try:
-            return assembly(store().submit(uid, options), s.public_url)
+            return assembly(await blocking(store().submit, uid, options), s.public_url)
         except BaseException:
             if owned:
                 store().discard_upload(uid)
@@ -234,12 +288,12 @@ def create_app(settings=None):
 
     @app.get("/v2/transcript/{jid}")
     async def get(jid: str):
-        return assembly(store().get(jid), s.public_url)
+        return assembly(await blocking(store().get, jid), s.public_url)
 
     @app.delete("/v2/transcript/{jid}")
     async def delete(jid: str):
-        result = assembly(store().get(jid), s.public_url)
-        store().delete(jid)
+        result = assembly(await blocking(store().get, jid), s.public_url)
+        await blocking(store().delete, jid)
         return {**result, "status": "completed", "text": None, "words": None}
 
     @app.get("/v2/transcript/{jid}/{extension}")
@@ -248,7 +302,7 @@ def create_app(settings=None):
             raise HTTPException(404, "Unknown endpoint")
         if not 20 <= chars_per_caption <= 200:
             raise HTTPException(400, "chars_per_caption must be 20..200")
-        job = store().get(jid)
+        job = await blocking(store().get, jid)
         if job["status"] != "completed":
             raise HTTPException(409, "Transcript is not complete")
         return PlainTextResponse(
@@ -299,17 +353,22 @@ def create_app(settings=None):
 
                 uid = await save(chunks())
             request.scope["release_upload_slot"]()
-            jid = store().submit(uid, options)["id"]
-            async with asyncio.timeout(s.sync_timeout):
-                while True:
-                    job = store().get(jid)
-                    if job["status"] == "error":
-                        raise HTTPException(422, job["error"])
-                    if job["status"] == "completed":
-                        break
-                    if await request.is_disconnected():
-                        raise HTTPException(499, "Client disconnected")
-                    await asyncio.sleep(0.2)
+            jid = (await blocking(store().submit, uid, options))["id"]
+            try:
+                async with asyncio.timeout(s.sync_timeout):
+                    while True:
+                        job = await blocking(store().get, jid)
+                        if job["status"] == "error":
+                            raise HTTPException(422, job["error"])
+                        if job["status"] == "completed":
+                            break
+                        if await request.is_disconnected():
+                            raise HTTPException(499, "Client disconnected")
+                        await asyncio.sleep(0.2)
+            except TimeoutError:
+                raise HTTPException(
+                    504, "Transcription wait timed out; use the asynchronous /v2 API"
+                ) from None
             result = json.loads(job["result"])
             if fmt == "json":
                 return {"text": result["text"]}
@@ -319,8 +378,6 @@ def create_app(settings=None):
                 result["text"] if fmt == "text" else subtitles(result, fmt == "vtt"),
                 media_type="text/vtt" if fmt == "vtt" else "text/plain",
             )
-        except TimeoutError:
-            raise HTTPException(504, "Transcription wait timed out; use the asynchronous /v2 API") from None
         finally:
             if jid:
                 with suppress(HTTPException):
@@ -336,25 +393,25 @@ def create_app(settings=None):
 
     @app.post("/internal/jobs/claim")
     async def claim():
-        job = store().claim()
+        job = await blocking(store().claim)
         return job if job else Response(status_code=204)
 
     @app.post("/internal/jobs/{jid}/heartbeat")
     async def heartbeat(jid: str, request: Request):
-        store().heartbeat(jid, lease(request))
+        await blocking(store().heartbeat, jid, lease(request))
         return {"ok": True}
 
     @app.get("/internal/jobs/{jid}/audio")
     async def audio(jid: str, request: Request):
-        return FileResponse(store().audio(jid, lease(request)), media_type="application/octet-stream")
+        path = await blocking(store().audio, jid, lease(request))
+        return FileResponse(path, media_type="application/octet-stream")
 
     @app.post("/internal/jobs/{jid}/complete")
     async def complete(jid: str, body: Completion, request: Request):
         if (body.result is None) == (body.error is None):
             raise HTTPException(400, "Provide exactly one of result or error")
-        store().finish(
-            jid, lease(request), body.result.model_dump() if body.result else None, body.error, body.retry
-        )
+        result = body.result.model_dump() if body.result else None
+        await blocking(store().finish, jid, lease(request), result, body.error, body.retry)
         return {"ok": True}
 
     return app

@@ -12,10 +12,11 @@ services:
       WORKER_API_KEY: ${WORKER_API_KEY:?Set WORKER_API_KEY}
       DB_MODE: ${DB_MODE:-memory}
       PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:-http://localhost:8080}
+    # Disk-backed and anonymous: uploads, multipart spooling and (in file mode) SQLite.
+    # See README "Persistence" for a named volume that survives `docker compose down`.
     volumes:
-      - data:/data
-    tmpfs:
-      - /tmp:size=384m,uid=10001,gid=10001
+      - type: volume
+        target: /data
     read_only: true
     cap_drop: [ALL]
     security_opt: [no-new-privileges:true]
@@ -45,5 +46,3 @@ services:
       api:
         condition: service_healthy
     restart: unless-stopped
-volumes:
-  data:

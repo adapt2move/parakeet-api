@@ -20,7 +20,15 @@ class Settings:
     lease: int = int(os.getenv("LEASE_SECONDS", "90"))
     attempts: int = int(os.getenv("MAX_ATTEMPTS", "3"))
     sync_timeout: int = int(os.getenv("SYNC_TIMEOUT_SECONDS", "1800"))
-    url_hosts: tuple[str, ...] = tuple(filter(None, os.getenv("AUDIO_URL_HOSTS", "").split(",")))
+    upload_slots: int = int(os.getenv("MAX_CONCURRENT_UPLOADS", "2"))
+    upload_idle: float = float(os.getenv("UPLOAD_IDLE_SECONDS", "15"))
+    upload_rate: int = int(os.getenv("MIN_UPLOAD_BYTES_PER_SECOND", str(64 * 1024)))
+    url_hosts: tuple[str, ...] = tuple(os.getenv("AUDIO_URL_HOSTS", "").split(","))
+
+    def __post_init__(self):
+        # Hostnames compare case-insensitively; tolerate "a.example, b.example".
+        hosts = tuple(filter(None, (host.strip().lower() for host in self.url_hosts)))
+        object.__setattr__(self, "url_hosts", hosts)
 
     def validate(self):
         if self.db_mode not in ("memory", "file"):
@@ -37,9 +45,14 @@ class Settings:
                 self.lease,
                 self.attempts,
                 self.sync_timeout,
+                self.upload_slots,
+                self.upload_idle,
+                self.upload_rate,
             )
             <= 0
         ):
             raise ValueError("Limits must be positive")
         if self.storage_bytes < self.max_bytes or self.lease < 15:
             raise ValueError("Storage must fit an upload; lease must be at least 15 seconds")
+        if any(not host.isascii() or set(host) & set("/:@[]?#% ") for host in self.url_hosts):
+            raise ValueError("AUDIO_URL_HOSTS must list bare hostnames, without scheme, port or path")

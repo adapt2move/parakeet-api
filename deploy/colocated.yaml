@@ -78,8 +78,6 @@ spec:
         volumeMounts:
         - name: data
           mountPath: /data
-        - name: api-tmp
-          mountPath: /tmp
         securityContext:
           allowPrivilegeEscalation: false
           readOnlyRootFilesystem: true
@@ -155,12 +153,10 @@ spec:
           periodSeconds: 5
           failureThreshold: 60
       volumes:
+      # Audio quota plus multipart spooling (MAX_CONCURRENT_UPLOADS x MAX_UPLOAD_BYTES).
       - name: data
         emptyDir:
           sizeLimit: 3Gi
-      - name: api-tmp
-        emptyDir:
-          sizeLimit: 384Mi
       - name: scratch
         emptyDir:
           sizeLimit: 2Gi

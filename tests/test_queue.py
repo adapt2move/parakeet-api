@@ -120,3 +120,37 @@ def test_memory_mode_does_not_destroy_existing_file_database(settings):
         Store(replace(settings, db_mode="memory"))
     assert disk.get(job["id"])["status"] == "queued"
     assert (disk.blobs / job["upload_id"]).exists()
+
+
+def uploaded_bytes(store):
+    with store.connect() as db:
+        return db.execute("SELECT coalesce(sum(bytes),0) FROM uploads").fetchone()[0]
+
+
+def test_finished_jobs_release_audio_but_stay_idempotent(settings, result):
+    store = Store(settings)
+    job = submit(store)
+    claim = store.claim()
+    assert claim["bytes"] == 5
+    # A result always completes the job, even if a worker also asks for a retry.
+    store.finish(claim["id"], claim["token"], result, retry=True)
+    assert store.get(job["id"])["status"] == "completed"
+    assert not (store.blobs / job["upload_id"]).exists() and uploaded_bytes(store) == 0
+    assert store.submit(job["upload_id"], {})["id"] == job["id"]
+
+
+def test_failed_jobs_release_audio(settings):
+    store = Store(replace(settings, attempts=1))
+    failed, expired, aged = submit(store), submit(store), submit(store)
+    claim = store.claim()
+    store.finish(claim["id"], claim["token"], error="Audio could not be decoded")
+    claim = store.claim()
+    with store.connect() as db:
+        db.execute("UPDATE jobs SET lease=0 WHERE id=?", (claim["id"],))
+        db.execute("UPDATE jobs SET created=0 WHERE id=?", (aged["id"],))
+    store.cleanup()
+    assert store.claim() is None
+    for job in (failed, expired, aged):
+        assert store.get(job["id"])["status"] == "error"
+        assert not (store.blobs / job["upload_id"]).exists()
+    assert uploaded_bytes(store) == 0

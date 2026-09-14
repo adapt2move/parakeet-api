@@ -18,8 +18,8 @@ from .engine import Engine
 
 API_URL = os.getenv("API_URL", "http://api:8080").rstrip("/")
 KEY = os.getenv("WORKER_API_KEY", "")
-MAX_BYTES = int(os.getenv("MAX_UPLOAD_BYTES", str(128 * 1024 * 1024)))
 STALL_SECONDS = int(os.getenv("WORKER_STALL_SECONDS", "300"))
+BACKOFF_SECONDS = 1
 state = {"ready": False, "busy": False, "progress": time.monotonic(), "completed": 0, "failed": 0}
 
 
@@ -32,6 +32,42 @@ def progress():
     state["progress"] = time.monotonic()
 
 
+class LeaseLost(Exception):
+    """The API fenced this worker out: the job expired, was deleted or belongs to another worker."""
+
+
+def checked(response):
+    if response.status_code == 409:
+        raise LeaseLost()
+    response.raise_for_status()
+    return response
+
+
+async def post(client, path, headers, payload=None, attempts=4):
+    # Transient API failures must not discard finished inference. 4xx answers are final.
+    for attempt in range(attempts):
+        last = attempt == attempts - 1
+        try:
+            response = await client.post(path, headers=headers, json=payload)
+        except httpx.TransportError:
+            if last:
+                raise
+        else:
+            if response.status_code < 500 or last:
+                return checked(response)
+        await asyncio.sleep(BACKOFF_SECONDS * 2**attempt)
+
+
+def permanent(exc):
+    """Failures that would repeat on every attempt, with a message that is safe for clients."""
+    if isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code < 500:
+        return "Transcription rejected by API"
+    if type(exc) is ValueError:
+        # Only our own validation errors have messages safe for clients.
+        return str(exc)
+    return None
+
+
 async def execute(client, engine, job, shutdown):
     jid, token = job["id"], job["token"]
     headers = {"x-lease-token": token}
@@ -41,32 +77,38 @@ async def execute(client, engine, job, shutdown):
     progress()
 
     async def renew():
+        renewed = started
         while True:
             await asyncio.sleep(job["lease_seconds"] / 3)
             if shutdown.is_set() or time.monotonic() - state["progress"] > STALL_SECONDS:
                 cancel.set()
                 return
+            sent = time.monotonic()
             try:
-                response = await client.post(f"/internal/jobs/{jid}/heartbeat", headers=headers)
-                response.raise_for_status()
-            except httpx.HTTPError:
-                # Do not continue producing results after uncertain ownership.
+                checked(await client.post(f"/internal/jobs/{jid}/heartbeat", headers=headers))
+                renewed = sent
+            except LeaseLost:
                 cancel.set()
                 return
+            except httpx.HTTPError:
+                # One failed renewal leaves most of the lease. Stop once it has certainly expired.
+                if time.monotonic() - renewed >= job["lease_seconds"]:
+                    cancel.set()
+                    return
 
     heartbeat = asyncio.create_task(renew())
     try:
         with tempfile.TemporaryDirectory(prefix="parakeet-job-") as directory:
             size = 0
             async with client.stream("GET", f"/internal/jobs/{jid}/audio", headers=headers) as response:
-                response.raise_for_status()
+                checked(response)
                 with (Path(directory) / "input").open("wb") as target:
                     async for chunk in response.aiter_bytes():
                         if cancel.is_set():
                             raise InterruptedError()
                         size += len(chunk)
-                        if size > MAX_BYTES:
-                            raise ValueError("Audio exceeds worker upload limit")
+                        if size > job["bytes"]:
+                            raise ValueError("Audio is larger than its upload")
                         target.write(chunk)
                         progress()
             # Shield native inference so shutdown never deletes its input mid-decode.
@@ -80,10 +122,7 @@ async def execute(client, engine, job, shutdown):
                 raise
             if cancel.is_set():
                 raise InterruptedError()
-            response = await client.post(
-                f"/internal/jobs/{jid}/complete", headers=headers, json={"result": result}
-            )
-            response.raise_for_status()
+            await post(client, f"/internal/jobs/{jid}/complete", headers, {"result": result})
             state["completed"] += 1
             event(
                 "transcribed",
@@ -93,6 +132,9 @@ async def execute(client, engine, job, shutdown):
                 seam_fallbacks=result["seam_fallbacks"],
                 processing_ms=round((time.monotonic() - started) * 1000),
             )
+    except LeaseLost:
+        cancel.set()
+        event("lease_lost")
     except (InterruptedError, asyncio.CancelledError):
         cancel.set()
         if shutdown.is_set():
@@ -101,14 +143,10 @@ async def execute(client, engine, job, shutdown):
         state["failed"] += 1
         event("job_failed", error_type=type(exc).__name__)
         if not cancel.is_set():
-            with suppress(httpx.HTTPError):
-                # Only our own validation errors have messages safe for clients.
-                error = str(exc) if type(exc) is ValueError else "Worker processing failed"
-                await client.post(
-                    f"/internal/jobs/{jid}/complete",
-                    headers=headers,
-                    json={"error": error[:200], "retry": not isinstance(exc, ValueError)},
-                )
+            error = permanent(exc)
+            payload = {"error": (error or "Worker processing failed")[:200], "retry": error is None}
+            with suppress(httpx.HTTPError, LeaseLost):
+                await post(client, f"/internal/jobs/{jid}/complete", headers, payload)
     finally:
         cancel.set()
         heartbeat.cancel()

@@ -16,7 +16,7 @@ openssl rand -hex 32
 docker compose up --build -d
 ```
 
-The API listens on `127.0.0.1:8080`. Compose limits the API to 0.25 CPU / 384 MiB and the worker to 1.75 CPU / 4 GiB. SQLite stays in API process memory. Uploaded audio uses a Docker scratch volume and is removed on API restart in memory mode. Worker scratch uses a separate disk volume. `docker compose down -v` deletes these volumes and any unfinished work.
+The API listens on `127.0.0.1:8080`. Compose limits the API to 0.25 CPU / 384 MiB and the worker to 1.75 CPU / 4 GiB. SQLite stays in API process memory. Uploaded audio and multipart request bodies use an anonymous disk volume at `/data`, never a RAM-backed tmpfs, and are removed on API restart in memory mode. Worker scratch uses a separate disk volume. `docker compose down -v` deletes these volumes and any unfinished work. See [Persistence](#persistence) to keep jobs across restarts.
 
 For published images, use `docker compose up -d --no-build`. Images are `ghcr.io/adapt2move/parakeet-api` and `ghcr.io/adapt2move/parakeet-worker`, for Linux amd64 and arm64. CI publishes `main`, full `sha-<commit>` tags, and version tags when a `v*` Git tag is pushed. Pin a digest for deployment. Each image pair is tested with real inference before publication.
 
@@ -99,32 +99,55 @@ This worker requires a sherpa-onnx-compatible NeMo transducer export with token 
 
 Only **one API process / replica** may own the queue and audio directory. A process lock catches accidental duplicate API processes. Use local block storage, not a shared SQLite file over NFS. Worker replicas never open SQLite or mount API storage.
 
-Workers receive a 90-second lease and renew it during processing. An expired lease returns the job to the queue, up to three attempts. A lease token prevents an old worker from committing after reassignment or deletion. Execution is at least once. Re-submitting the same upload with the same options returns its existing job, which makes that submission idempotent. A new upload creates a new job.
+Workers receive a 90-second lease and renew it during processing. A failed renewal is retried until the lease has certainly expired. An expired lease returns the job to the queue, up to three attempts. A lease token prevents an old worker from committing after reassignment or deletion. Execution is at least once. Re-submitting the same upload with the same options returns its existing job, which makes that submission idempotent. A new upload creates a new job.
+
+A worker retries transient API failures (network errors, `5xx`) when submitting a finished result, so inference is not repeated. `409` means the job was deleted, expired or reassigned; the worker drops it silently. Other `4xx` answers, invalid audio and time limits are permanent job errors. Unexpected worker failures return the job to the queue.
 
 | Setting | Default | Applies to |
 | --- | --- | --- |
 | `DB_MODE` | `memory`; optionally `file` | API |
-| `MAX_UPLOAD_BYTES` | 134217728, 128 MiB | API and worker; keep equal |
+| `MAX_UPLOAD_BYTES` | 134217728, 128 MiB | API; workers receive each upload's size with the job |
 | `MAX_STORAGE_BYTES` | 2147483648, 2 GiB | API uploaded-audio quota |
 | `MAX_PENDING_JOBS` | 32 queued + processing | API |
-| `RETENTION_SECONDS` | 3600 | Completed/failed jobs and audio |
+| `RETENTION_SECONDS` | 3600 | Completed/failed transcripts; their audio is deleted immediately |
 | `MAX_JOB_AGE_SECONDS` | 21600, 6 hours | Total queued + processing age |
 | `LEASE_SECONDS` / `MAX_ATTEMPTS` | 90 / 3 | API |
 | `SYNC_TIMEOUT_SECONDS` | 1800 | OpenAI request wait |
 | `MAX_AUDIO_SECONDS` | 10800, 3 hours | Worker, hard ceiling 3 hours |
-| `JOB_TIMEOUT_SECONDS` | 1800 | Worker, per inference attempt |
+| `JOB_TIMEOUT_SECONDS` | 1800 | Worker, per inference attempt; must cover `MAX_AUDIO_SECONDS` on your CPU |
 | `PARAKEET_THREADS` | 3 | CPU inference threads |
 | `WORKER_STALL_SECONDS` | 300 | Worker health / lease renewal watchdog |
+| `MAX_CONCURRENT_UPLOADS` | 2 | API request bodies spooled at once |
+| `UPLOAD_IDLE_SECONDS` | 15 | API; longest pause in an upload, and grace before the rate check |
+| `MIN_UPLOAD_BYTES_PER_SECOND` | 65536, 64 KiB/s | API; average rate for uploads and URL downloads |
 | `PUBLIC_BASE_URL` | `http://localhost:8080` | Exact public origin used for opaque upload URLs |
 | `AUDIO_URL_HOSTS` | Empty | Comma-separated trusted HTTPS download origins |
 
-Reservations bound stored uploads. Two simultaneous body uploads are allowed; completed uploads release their slots while requests wait in the queue. A full queue or upload quota returns `429` with `Retry-After`. Byte and duration limits are explicit; oversized audio is rejected rather than silently truncated. In file mode, the API volume also needs room for SQLite and its WAL, beyond the audio quota. In memory mode, retained transcript data counts against the API RAM limit.
+Reservations bound stored uploads. `MAX_CONCURRENT_UPLOADS` simultaneous body uploads are allowed; completed uploads release their slots while requests wait in the queue. An upload that pauses longer than `UPLOAD_IDLE_SECONDS`, or averages below `MIN_UPLOAD_BYTES_PER_SECOND` after that grace period, fails with `408` and frees its slot. A slow client cannot hold a slot by trickling bytes. At the default rate a 128 MiB upload may take up to about 35 minutes. Size the API data volume for `MAX_STORAGE_BYTES` plus `MAX_CONCURRENT_UPLOADS × MAX_UPLOAD_BYTES` of multipart spooling. A full queue or upload quota returns `429` with `Retry-After`. Byte and duration limits are explicit; oversized audio is rejected rather than silently truncated. `JOB_TIMEOUT_SECONDS` ends an inference attempt permanently. Measure the real-time factor on the target CPU and raise it if the longest allowed recording cannot finish in time, especially with fewer `PARAKEET_THREADS`. In file mode, the API volume also needs room for SQLite and its WAL, beyond the audio quota. In memory mode, retained transcript data counts against the API RAM limit.
 
-A cleanup task runs every 30 seconds. Unsubmitted uploads expire after at least one hour. OpenAI jobs and audio are deleted after the final result is constructed, on timeout or on disconnect. AssemblyAI jobs remain pollable for the retention period and can be deleted earlier. Deletion stops lease renewal; a worker may need to finish its current native inference window before removing its temporary copy.
+A cleanup task runs every 30 seconds. Unsubmitted uploads expire after at least one hour. OpenAI jobs and audio are deleted after the final result is constructed, on timeout or on disconnect. Audio is deleted as soon as a job completes or fails; only the transcript or error remains. AssemblyAI jobs remain pollable for the retention period and can be deleted earlier. Deletion stops lease renewal; a worker may need to finish its current native inference window before removing its temporary copy.
 
 SQLite stores job state, leases, options and completed results for polling. With `DB_MODE=memory`, one serialized connection keeps the database in RAM; no SQLite database or journal file is written. An API process restart loses all jobs and results, including accepted jobs still being processed. Clients must resubmit; IDs from before the restart return 404 and old workers cannot commit results. Unrecoverable uploaded files are removed on API startup.
 
-For optional restart recovery, set `DB_MODE=file` and put `DATA_DIR` on a PVC. Memory mode refuses a directory containing an existing `jobs.sqlite3`, so changing the default cannot silently discard a durable queue. Existing deployments must set `DB_MODE=file` explicitly or switch to a fresh data directory. In memory mode, disk `emptyDir` holds temporary audio only. It is not RAM-only audio handling and does not promise zero writes to the host disk. Worker scratch can always be `emptyDir`. Deleting rows and files is not a secure erasure guarantee for storage snapshots or backups; keep this service out of long-lived media backups.
+### Persistence
+
+By default all API state is ephemeral. For optional restart recovery, set `DB_MODE=file` and put `DATA_DIR` on persistent storage. With Compose, add an override file:
+
+```yaml
+# compose.override.yaml
+services:
+  api:
+    environment:
+      DB_MODE: file
+    volumes:
+      - type: volume
+        source: data
+        target: /data
+volumes:
+  data:
+```
+
+`docker compose down` keeps the named volume; `docker compose down -v` deletes it. For Kubernetes, see `deploy/README.md`. Memory mode refuses a directory containing an existing `jobs.sqlite3`, so changing the default cannot silently discard a durable queue. Existing deployments must set `DB_MODE=file` explicitly or switch to a fresh data directory. In memory mode, disk `emptyDir` holds temporary audio only. It is not RAM-only audio handling and does not promise zero writes to the host disk. Worker scratch can always be `emptyDir`. Deleting rows and files is not a secure erasure guarantee for storage snapshots or backups; keep this service out of long-lived media backups.
 
 ## Deployment
 

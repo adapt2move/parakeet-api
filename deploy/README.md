@@ -24,7 +24,31 @@ For the distributed variant:
 kubectl -n parakeet scale deployment/parakeet-worker --replicas=2
 ```
 
-Each additional worker can consume up to 3.5 CPU and 6 GiB RAM. Reserve resources accordingly. Use the smaller limits from `compose.yaml` when testing on a Mac. API process restarts lose jobs and results. For durable jobs, explicitly set `DB_MODE=file` and replace the API `data` volume with a PVC.
+Each additional worker can consume up to 3.5 CPU and 6 GiB RAM. Reserve resources accordingly. Use the smaller limits from `compose.yaml` when testing on a Mac. API process restarts lose jobs and results. For durable jobs, explicitly set `DB_MODE=file` and replace the API `data` volume with a PVC:
+
+```yaml
+# In the parakeet-api Deployment:
+        env:
+        - name: DB_MODE
+          value: file
+      volumes:
+      - name: data
+        persistentVolumeClaim:
+          claimName: parakeet-api-data
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: parakeet-api-data
+  namespace: parakeet
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 3Gi
+```
+
+Use block storage, not NFS. Size the volume for `MAX_STORAGE_BYTES`, multipart spooling (`MAX_CONCURRENT_UPLOADS × MAX_UPLOAD_BYTES`) and SQLite with its WAL. Keep `strategy: Recreate`, so two API Pods never mount the volume at once.
 
 Before a production rollout, pin image digests, choose the public base URL, and add network rules appropriate to the cluster. Allow worker-to-API port 8080. Keep the worker health port private and block `/internal/*` at any external ingress. An API-key holder can access all jobs; this deployment is for a shared internal trust boundary.
 

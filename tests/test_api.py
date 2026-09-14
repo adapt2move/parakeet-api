@@ -1,7 +1,15 @@
+import asyncio
+import tempfile
 import time
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 
+import pytest
+from fastapi.testclient import TestClient
 from openai import OpenAI
+
+from parakeet_api.api import create_app
+from parakeet_api.settings import Settings
 
 
 def submit(client):
@@ -132,3 +140,70 @@ def test_assemblyai_sdk_upload_submit_poll_and_subtitles(client, settings, resul
     monkeypatch.setattr(aai, "settings", sdk_client.settings)
     monkeypatch.setattr(aai.Client, "_default", sdk_client)
     aai.Transcript.delete_by_id(transcript.id)
+
+
+def test_audio_url_rejects_parser_ambiguities(settings):
+    trusted = replace(settings, url_hosts=("example.org",))
+    with TestClient(create_app(trusted), headers={"authorization": settings.api_key}) as client:
+        for url in ("https://exa\tmple.org/a", "https://example.org/\x00", "https://example.org/a b"):
+            assert client.post("/v2/transcript", json={"audio_url": url}).status_code == 400
+
+
+def test_audio_url_hosts_are_normalized_and_validated(settings):
+    assert Settings(url_hosts=(" Example.org ", "", "cdn.example.org")).url_hosts == (
+        "example.org",
+        "cdn.example.org",
+    )
+    with pytest.raises(ValueError, match="bare hostnames"):
+        replace(settings, url_hosts=("https://example.org",)).validate()
+
+
+def test_multipart_spool_uses_data_volume(client, settings):
+    assert tempfile.gettempdir() == str(settings.data / "tmp")
+
+
+async def post_slowly(app, key, chunks, delay):
+    """Drive the ASGI app directly; TestClient always delivers a request body at once."""
+    pending, sent = list(chunks), []
+
+    async def receive():
+        if not pending:
+            await asyncio.Event().wait()
+        await asyncio.sleep(delay)
+        return {"type": "http.request", "body": pending.pop(0), "more_body": len(pending) > 0}
+
+    async def send(message):
+        sent.append(message)
+
+    scope = {
+        "type": "http",
+        "asgi": {"version": "3.0", "spec_version": "2.3"},
+        "http_version": "1.1",
+        "method": "POST",
+        "scheme": "http",
+        "path": "/v2/upload",
+        "raw_path": b"/v2/upload",
+        "root_path": "",
+        "query_string": b"",
+        "headers": [(b"authorization", key.encode())],
+        "client": ("test", 1),
+        "server": ("test", 80),
+    }
+    await app(scope, receive, send)
+    return next(m["status"] for m in sent if m["type"] == "http.response.start")
+
+
+def test_trickling_or_stalled_uploads_release_their_slot(settings):
+    limited = replace(settings, upload_slots=1, upload_idle=0.1, upload_rate=1000)
+    app = create_app(limited)
+
+    async def main():
+        async with app.router.lifespan_context(app):
+            key = limited.api_key
+            assert await post_slowly(app, key, [b"x"] * 20, delay=0.03) == 408
+            assert await post_slowly(app, key, [b"x", b"x"], delay=0.3) == 408
+            assert await post_slowly(app, key, [b"audio"], delay=0) == 200
+            # Rejected uploads leave no audio behind; only the accepted one remains.
+            assert len(list(app.state.store.blobs.iterdir())) == 1
+
+    asyncio.run(main())
