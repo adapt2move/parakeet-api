@@ -1,11 +1,9 @@
 package api
 
 import (
-	"bufio"
 	"bytes"
 	"errors"
 	"io"
-	"mime/multipart"
 	"net/http"
 	"net/url"
 	"strings"
@@ -119,9 +117,9 @@ func (a *API) transcribe(r *http.Request) (response, error) {
 	case "text":
 		return textResponse("text/plain", result.Text), nil
 	case "vtt":
-		return textResponse("text/vtt", formats.Subtitles(result, true, 80)), nil
+		return response{status: http.StatusOK, contentType: "text/vtt; charset=utf-8", body: formats.AppendSubtitles(nil, result, true, 80)}, nil
 	default:
-		return textResponse("text/plain", formats.Subtitles(result, false, 80)), nil
+		return response{status: http.StatusOK, contentType: "text/plain; charset=utf-8", body: formats.AppendSubtitles(nil, result, false, 80)}, nil
 	}
 }
 
@@ -210,14 +208,15 @@ func validateForm(f *form) (format string, granularities []string, options map[s
 // readForm parses the body like Starlette's request.form(): multipart and urlencoded bodies are
 // read, any other content type yields an empty form without reading the body.
 func (a *API) readForm(r *http.Request, f *form) error {
-	ctype, params := parseOptionsHeader(r.Header.Get("Content-Type"))
+	// Starlette decoded header values as Latin-1.
+	ctype, params := parseOptionsHeader(latin1String([]byte(r.Header.Get("Content-Type"))))
 	switch ctype {
 	case "multipart/form-data":
 		boundary, ok := params["boundary"]
 		if !ok {
 			return errMissingBoundary
 		}
-		if err := a.readMultipart(r.Body, boundary, f); err != nil {
+		if err := a.readMultipart(r.Body, latin1Bytes(boundary), f); err != nil {
 			// A parser may hide a failure of the body behind its own error; the body's error wins.
 			if b := state(r).body; b != nil && b.err != nil {
 				return b.err
@@ -236,75 +235,9 @@ func (a *API) readForm(r *http.Request, f *form) error {
 	return err
 }
 
-func (a *API) readMultipart(body io.Reader, boundary string, f *form) error {
-	br := bufio.NewReaderSize(body, 64*1024)
-	if ok, err := multipartStart(br, boundary); !ok || err != nil {
-		return err
-	}
-	mr := multipart.NewReader(br, boundary)
-	files, fields := 0, 0
-	for {
-		part, err := mr.NextRawPart()
-		if err == io.EOF || truncated(err) {
-			// python-multipart ended the form at the end of the body and dropped an unfinished part.
-			return nil
-		}
-		if err != nil {
-			return multipartError(err)
-		}
-		dispositions := part.Header.Values("Content-Disposition")
-		disposition := ""
-		if len(dispositions) > 0 {
-			disposition = dispositions[len(dispositions)-1]
-		}
-		_, options := parseOptionsHeader(disposition)
-		name, ok := options["name"]
-		if !ok {
-			return errMissingName
-		}
-		if _, isFile := options["filename"]; !isFile {
-			fields++
-			if fields > maxFormFields {
-				return errTooManyFields
-			}
-			data, err := io.ReadAll(io.LimitReader(part, maxFieldBytes+1))
-			if truncated(err) {
-				return nil
-			}
-			if err != nil {
-				return multipartError(err)
-			}
-			if len(data) > maxFieldBytes {
-				return errPartTooLarge
-			}
-			f.values = append(f.values, formValue{name: name, value: string(data)})
-			continue
-		}
-		files++
-		if files > maxFormFiles {
-			return errTooManyFiles
-		}
-		if name == "file" {
-			err = a.receiveFile(part, f)
-		} else {
-			_, err = io.Copy(io.Discard, part)
-		}
-		if truncated(err) {
-			if f.upload != "" {
-				a.store.DiscardUpload(f.upload)
-				f.upload, f.size, f.saveErr = "", 0, nil
-			}
-			return nil
-		}
-		if err != nil {
-			return multipartError(err)
-		}
-		f.values = append(f.values, formValue{name: name, file: true})
-	}
-}
-
 // receiveFile streams the file part into a new upload. Storage and size failures are kept in
 // f.saveErr so the fields can still be validated first, as Python did after spooling the form.
+// Only failures to read the part are returned.
 func (a *API) receiveFile(part io.Reader, f *form) error {
 	uid, err := a.store.Reserve()
 	if err != nil {
@@ -314,110 +247,60 @@ func (a *API) receiveFile(part io.Reader, f *form) error {
 	}
 	f.upload = uid
 	f.size, err = a.writeBlob(uid, part, nil)
-	if errors.Is(err, errAudioTooLarge) {
+	var storage *storageError
+	if errors.Is(err, errAudioTooLarge) || errors.As(err, &storage) {
 		f.saveErr = err
 		_, err = io.Copy(io.Discard, part)
 	}
 	return err
 }
 
-// multipartStart checks the start of a multipart body as python-multipart did: optional line
-// breaks, then the first boundary. It returns false without error for a body that ends before
-// any part starts, which is an empty form.
-func multipartStart(br *bufio.Reader, boundary string) (bool, error) {
-	skip := 0
-	if head, err := br.Peek(1); err != nil {
-		return false, peekError(err)
-	} else if head[0] == '\r' || head[0] == '\n' {
-		// python-multipart jumped from a leading line break to the next hyphen.
-		for {
-			data, err := br.Peek(skip + 1)
-			if err != nil {
-				return false, peekError(err)
-			}
-			if data[skip] == '-' {
-				break
-			}
-			skip++
-			if skip >= br.Size() {
-				return false, errInvalidOptions
-			}
-		}
-	}
-	delimiter := "--" + boundary
-	for i := 0; i <= len(delimiter)+1; i++ {
-		data, err := br.Peek(skip + i + 1)
-		if err != nil {
-			return false, peekError(err)
-		}
-		c := data[skip+i]
-		switch {
-		case i < len(delimiter):
-			if c != delimiter[i] {
-				return false, errInvalidOptions
-			}
-		case i == len(delimiter):
-			if c != '\r' && c != '-' {
-				return false, errInvalidOptions
-			}
-			if c == '-' {
-				i++ // an immediately closed, empty form
-			}
-		default:
-			if c != '\n' {
-				return false, errInvalidOptions
-			}
-		}
-	}
-	_, err := br.Discard(skip)
-	return true, err
-}
-
-// truncated reports a body that ended inside a part, as opposed to a failure of the body itself.
-func truncated(err error) bool {
-	var ae *apiError
-	return err != nil && !errors.As(err, &ae) && (errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF))
-}
-
-func peekError(err error) error {
-	if err == io.EOF {
-		return nil
-	}
-	return multipartError(err)
-}
-
-// multipartError keeps limit errors of the body and maps parser failures to the generic 400 that
-// python-multipart's ValueError produced.
-func multipartError(err error) error {
-	var ae *apiError
-	if errors.As(err, &ae) {
-		return ae
-	}
-	return errInvalidOptions
-}
-
-// readURLEncoded parses a form body like python-multipart's QuerystringParser.
+// readURLEncoded parses a form body like python-multipart's QuerystringParser with Starlette's
+// limits. It streams: a field fails once its name and value pass 64 KiB, and the form fails at
+// the end of its eleventh field, without buffering the rest of the body.
 func readURLEncoded(body io.Reader, f *form) error {
-	data, err := io.ReadAll(body)
-	if err != nil {
-		return err
-	}
-	fields := 0
-	for _, chunk := range bytes.Split(data, []byte("&")) {
-		if len(chunk) == 0 {
-			continue
-		}
-		name, value, _ := bytes.Cut(chunk, []byte("="))
-		if len(name)+len(value) > maxFieldBytes {
-			return errFieldTooLarge
+	buf := make([]byte, 32*1024)
+	var field []byte
+	size, equals, fields := 0, false, 0 // size counts name and value bytes, not the first '='
+	end := func() error {
+		if len(field) == 0 {
+			return nil
 		}
 		fields++
 		if fields > maxFormFields {
 			return errTooManyFields
 		}
+		name, value, _ := bytes.Cut(field, []byte("="))
 		f.values = append(f.values, formValue{name: unquotePlus(name), value: unquotePlus(value)})
+		field, size, equals = nil, 0, false
+		return nil
 	}
-	return nil
+	for {
+		n, err := body.Read(buf)
+		for _, c := range buf[:n] {
+			switch {
+			case c == '&':
+				if e := end(); e != nil {
+					return e
+				}
+				continue
+			case c == '=' && !equals:
+				equals = true
+			default:
+				size++
+				if size > maxFieldBytes {
+					return errFieldTooLarge
+				}
+			}
+			field = append(field, c)
+		}
+		if err == io.EOF {
+			return end()
+		}
+		if err != nil {
+			return err
+		}
+	}
 }
 
 func unquotePlus(b []byte) string {

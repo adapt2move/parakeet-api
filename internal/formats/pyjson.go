@@ -581,29 +581,49 @@ func AppendFloat(dst []byte, f float64) []byte {
 	case f < -1.7976931348623157e308:
 		return append(dst, "-Infinity"...)
 	}
-	e := strconv.AppendFloat(nil, f, 'e', -1, 64)
+	var buf [32]byte
+	e := strconv.AppendFloat(buf[:0], f, 'e', -1, 64)
 	if e[0] == '-' {
 		dst = append(dst, '-')
 		e = e[1:]
 	}
-	mantissa, exponent, _ := bytes.Cut(e, []byte("e"))
-	digits := bytes.Replace(mantissa, []byte("."), nil, 1)
-	exp, _ := strconv.Atoi(string(exponent))
+	mark := bytes.IndexByte(e, 'e')
+	mantissa, exponent := e[:mark], e[mark+1:]
+	// The mantissa is "d" or "d.ddd"; digits drops its point.
+	var digitBuf [24]byte
+	digits := append(digitBuf[:0], mantissa[0])
+	if len(mantissa) > 2 {
+		digits = append(digits, mantissa[2:]...)
+	}
+	exp := 0
+	for _, c := range exponent[1:] {
+		exp = exp*10 + int(c-'0')
+	}
+	if exponent[0] == '-' {
+		exp = -exp
+	}
 	decpt := exp + 1
 	switch {
 	case decpt <= -4 || decpt > 16:
 		return append(dst, e...)
 	case decpt <= 0:
 		dst = append(dst, "0."...)
-		dst = append(dst, bytes.Repeat([]byte("0"), -decpt)...)
+		dst = appendZeros(dst, -decpt)
 		return append(dst, digits...)
 	case decpt >= len(digits):
 		dst = append(dst, digits...)
-		dst = append(dst, bytes.Repeat([]byte("0"), decpt-len(digits))...)
+		dst = appendZeros(dst, decpt-len(digits))
 		return append(dst, ".0"...)
 	default:
 		dst = append(dst, digits[:decpt]...)
 		dst = append(dst, '.')
 		return append(dst, digits[decpt:]...)
 	}
+}
+
+func appendZeros(dst []byte, n int) []byte {
+	for range n {
+		dst = append(dst, '0')
+	}
+	return dst
 }

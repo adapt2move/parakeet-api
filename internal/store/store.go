@@ -9,7 +9,6 @@ import (
 	"crypto/rand"
 	"crypto/subtle"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -34,6 +33,10 @@ const (
 // staleAge bounds how long unsubmitted uploads and unknown files may live.
 // It exceeds the one hour transfer limit of an upload.
 const staleAge = 3700 * time.Second
+
+// minUploadCharge is what a stored upload costs at least, capped at MaxUploadBytes. Every upload
+// takes a file and an entry in memory for an hour, so tiny uploads must not be nearly free.
+const minUploadCharge = 64 * 1024
 
 // Config holds the limits the queue enforces.
 type Config struct {
@@ -68,13 +71,14 @@ var (
 )
 
 // Job is a snapshot of a job. Result is shared with the store and must not be modified.
+// The store never looks into a result; the caller decides what it holds.
 type Job struct {
 	ID       string
 	UploadID string
 	Status   Status
 	Options  map[string]string
-	Result   json.RawMessage // set only when completed
-	Error    *string         // nil unless the job failed
+	Result   any     // set only when completed
+	Error    *string // nil unless the job failed
 	Created  time.Time
 	Updated  time.Time
 	Attempts int
@@ -91,7 +95,8 @@ type Claim struct {
 
 type upload struct {
 	id      string
-	bytes   int64 // reservation, stored size, or 0 once the job finished
+	bytes   int64 // storage charged: the reservation, the charge of the stored file, or 0 once the job finished
+	size    int64 // stored file size
 	ready   bool
 	created time.Time
 	job     *job
@@ -103,7 +108,7 @@ type job struct {
 	upload   *upload
 	status   Status
 	options  map[string]string
-	result   json.RawMessage
+	result   any
 	err      *string
 	created  time.Time
 	updated  time.Time
@@ -183,7 +188,8 @@ func (s *Store) Reserve() (string, error) {
 	return id, nil
 }
 
-// UploadReady replaces the reservation with the stored size and allows submission.
+// UploadReady replaces the reservation with the charge for the stored size, at least
+// min(64 KiB, MaxUploadBytes), and allows submission.
 func (s *Store) UploadReady(uploadID string, size int64) error {
 	now := s.cfg.Now()
 	s.mu.Lock()
@@ -192,8 +198,9 @@ func (s *Store) UploadReady(uploadID string, size int64) error {
 	if u == nil || u.job != nil {
 		return errUploadGone
 	}
-	s.used += size - u.bytes
-	u.bytes, u.ready, u.created = size, true, now
+	charge := max(size, min(minUploadCharge, s.cfg.MaxUploadBytes))
+	s.used += charge - u.bytes
+	u.bytes, u.size, u.ready, u.created = charge, size, true, now
 	return nil
 }
 
@@ -292,7 +299,7 @@ func (s *Store) Claim() *Claim {
 			ID:           next.id,
 			Token:        next.token,
 			LeaseSeconds: int(s.cfg.Lease / time.Second),
-			Bytes:        next.upload.bytes,
+			Bytes:        next.upload.size,
 			Options:      maps.Clone(next.options),
 		}
 	}
@@ -339,8 +346,8 @@ func (s *Store) Audio(id, token string) (*os.File, error) {
 
 // Finish ends a leased attempt. A non-nil result completes the job even when
 // retry is set. Otherwise the job is queued again if retry is set and attempts
-// remain, or it fails with message. The store keeps result without copying it.
-func (s *Store) Finish(id, token string, result json.RawMessage, message string, retry bool) error {
+// remain, or it fails with message. The store keeps result as it is.
+func (s *Store) Finish(id, token string, result any, message string, retry bool) error {
 	now := s.cfg.Now()
 	s.mu.Lock()
 	j, err := s.fenced(id, token, now)

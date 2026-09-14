@@ -33,6 +33,9 @@ func (c *clock) Advance(d time.Duration) {
 var result = json.RawMessage(`{"text":"Hello world.","audio_duration_ms":2100,"chunks":1,"seam_fallbacks":0,` +
 	`"words":[{"text":"Hello","start":120,"end":610,"confidence":0.8},{"text":"world.","start":900,"end":1700,"confidence":0.7}]}`)
 
+// charged is the storage a 5 byte upload costs under config: min(64 KiB, MaxUploadBytes).
+const charged = 1024
+
 func config(dir string, c *clock) Config {
 	return Config{
 		DataDir:         dir,
@@ -175,7 +178,7 @@ func TestClaimIsExclusiveAndLeaseExpiryReassigns(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.Status != StatusCompleted || string(got.Result) != string(result) || got.Error != nil || got.Attempts != 2 {
+	if got.Status != StatusCompleted || got.Result == nil || string(got.Result.(json.RawMessage)) != string(result) || got.Error != nil || got.Attempts != 2 {
 		t.Fatalf("unexpected job %+v", got)
 	}
 }
@@ -266,7 +269,7 @@ func TestRetryRequeuesWithoutError(t *testing.T) {
 		t.Fatal(err)
 	}
 	got, _ := s.Get(job.ID)
-	if got.Status != StatusQueued || got.Error != nil || !exists(s, job.UploadID) || used(s) != 5 {
+	if got.Status != StatusQueued || got.Error != nil || !exists(s, job.UploadID) || used(s) != charged {
 		t.Fatalf("unexpected job %+v", got)
 	}
 	// Requeueing revokes the old token.
@@ -307,7 +310,7 @@ func TestQueueAndStorageAreBounded(t *testing.T) {
 	if e := wantError(t, err, http.StatusTooManyRequests); e.RetryAfter != 10 || e.Message != "Queue full" {
 		t.Fatalf("unexpected error %+v", e)
 	}
-	for range 3 {
+	for range 2 {
 		if _, err := s.Reserve(); err != nil {
 			t.Fatal(err)
 		}
@@ -316,7 +319,7 @@ func TestQueueAndStorageAreBounded(t *testing.T) {
 	if e := wantError(t, err, http.StatusTooManyRequests); e.RetryAfter != 30 || e.Message != "Audio storage full" {
 		t.Fatalf("unexpected error %+v", e)
 	}
-	if used(s) != 5+5+3*1024 {
+	if used(s) != 2*charged+2*1024 {
 		t.Fatalf("used = %d", used(s))
 	}
 }
@@ -446,7 +449,7 @@ func TestUnsubmittedUploadsExpire(t *testing.T) {
 	if err := s.Cleanup(); err != nil {
 		t.Fatal(err)
 	}
-	if !exists(s, uid) || used(s) != 5+1024 {
+	if !exists(s, uid) || used(s) != charged+1024 {
 		t.Fatal("upload expired too early")
 	}
 	c.Advance(time.Second)
@@ -702,5 +705,52 @@ func TestNewUUID(t *testing.T) {
 			t.Fatalf("bad uuid %q", id)
 		}
 		seen[id] = true
+	}
+}
+
+// Tiny uploads are charged at least 64 KiB, so that storage bounds how many can wait unsubmitted.
+// The claim still reports the real size.
+func TestTinyUploadsAreChargedAMinimum(t *testing.T) {
+	s, _ := newStore(t, func(c *Config) { c.MaxUploadBytes = 1 << 20; c.MaxStorageBytes = 2 << 20 })
+	var first string
+	for i := range 16 {
+		uid, err := s.Reserve()
+		if err != nil {
+			t.Fatalf("upload %d: %v", i, err)
+		}
+		if err := s.UploadReady(uid, 1); err != nil {
+			t.Fatal(err)
+		}
+		if first == "" {
+			first = uid
+		}
+	}
+	if used(s) != 16*minUploadCharge {
+		t.Fatalf("used = %d", used(s))
+	}
+	// One more upload fits; after it no full reservation does.
+	uid, err := s.Reserve()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.UploadReady(uid, 1); err != nil {
+		t.Fatal(err)
+	}
+	_, err = s.Reserve()
+	wantError(t, err, http.StatusTooManyRequests)
+	if _, err := s.Submit(first, nil); err != nil {
+		t.Fatal(err)
+	}
+	if claim := mustClaim(t, s); claim.Bytes != 1 {
+		t.Fatalf("claim bytes = %d", claim.Bytes)
+	}
+	// Large uploads are charged their size.
+	s2, _ := newStore(t, func(c *Config) { c.MaxUploadBytes = 1 << 20; c.MaxStorageBytes = 2 << 20 })
+	uid, err = s2.Reserve()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s2.UploadReady(uid, 100_000); err != nil || used(s2) != 100_000 {
+		t.Fatalf("used = %d, %v", used(s2), err)
 	}
 }

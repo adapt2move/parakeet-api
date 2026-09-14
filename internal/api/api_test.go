@@ -13,6 +13,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -545,5 +546,252 @@ func TestHealthcheck(t *testing.T) {
 	}
 	if code := Healthcheck("no-port"); code != 1 {
 		t.Fatalf("invalid address: %d", code)
+	}
+}
+
+// A declared body the handler never reads must not hold the connection open: the server
+// discards small unread bodies after the handler returns, which needs a read deadline.
+func TestUnreadBodiesDoNotHoldConnections(t *testing.T) {
+	a := newAPI(t, nil)
+	srv := serve(t, a)
+	for _, tc := range []struct {
+		head   string
+		status int
+	}{
+		{"GET /health/live HTTP/1.1\nHost: x\nContent-Length: 100\n", 200},
+		{"GET /health/ready HTTP/1.1\nHost: x\nTransfer-Encoding: chunked\n", 200},
+		{"POST /v2/transcript HTTP/1.1\nHost: x\nContent-Length: 100\n", 401},
+		{"GET /metrics HTTP/1.1\nHost: x\nAuthorization: " + clientKey + "\nContent-Length: 10\n", 200},
+		{"POST /internal/jobs/claim HTTP/1.1\nHost: x\nAuthorization: " + workerKey + "\nTransfer-Encoding: chunked\n", 204},
+		{"PUT /v2/upload HTTP/1.1\nHost: x\nAuthorization: " + clientKey + "\nContent-Length: 10\n", 405},
+		{"GET /v2/nothing HTTP/1.1\nHost: x\nAuthorization: " + clientKey + "\nContent-Length: 10\n", 404},
+	} {
+		start := time.Now()
+		conn, r := rawConn(t, srv, tc.head)
+		res, _ := readResponse(t, r)
+		if res.StatusCode != tc.status {
+			t.Fatalf("%q: %d", tc.head, res.StatusCode)
+		}
+		conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+		if _, err := io.Copy(io.Discard, r); err != nil {
+			t.Fatalf("%q: connection stayed open: %v", tc.head, err)
+		}
+		if elapsed := time.Since(start); elapsed > a.cfg.UploadIdle+time.Second {
+			t.Fatalf("%q: connection held for %v", tc.head, elapsed)
+		}
+	}
+}
+
+func TestURLEncodedFormsStream(t *testing.T) {
+	a := newAPI(t, func(s *Settings) {
+		s.MaxUploadBytes = 8 << 20
+		s.MaxStorageBytes = 16 << 20
+		s.UploadIdle = 2 * time.Second
+	})
+	srv := serve(t, a)
+	const urlencoded = "application/x-www-form-urlencoded"
+	v1 := func(message string) string {
+		return `{"error":{"message":"` + message + `","type":"invalid_request_error","code":"400"}}`
+	}
+	for _, tc := range []struct{ body, want string }{
+		{"&&model=parakeet&&language=en&", v1("file must be an audio file")},
+		{strings.Repeat("timestamp_granularities%5B%5D=word&", 10), v1("file must be an audio file")},
+		{strings.Repeat("a=1&", 11), v1("Too many fields. Maximum number of fields is 10.")},
+		{"model=" + strings.Repeat("x", 65531) + "&language=", v1("Unknown model; use parakeet")},
+		{"a=" + strings.Repeat("x", 65536), v1("Field exceeded maximum size of 64KB.")},
+		{strings.Repeat("x", 65537), v1("Field exceeded maximum size of 64KB.")},
+		{"=" + strings.Repeat("=", 65537), v1("Field exceeded maximum size of 64KB.")},
+	} {
+		if res, body := do(t, srv, "POST", "/v1/audio/transcriptions", clientKey, strings.NewReader(tc.body), "Content-Type", urlencoded); res.StatusCode != 400 || body != tc.want {
+			t.Fatalf("%.40q: %d %s", tc.body, res.StatusCode, body)
+		}
+	}
+
+	// The eleventh field fails the form before the rest of the declared body arrives.
+	head := "POST /v1/audio/transcriptions HTTP/1.1\nHost: x\nAuthorization: " + clientKey +
+		"\nContent-Type: " + urlencoded + "\nContent-Length: 1000000\n"
+	conn, r := rawConn(t, srv, head)
+	io.WriteString(conn, strings.Repeat("a=1&", 11))
+	if res, body := readResponse(t, r); res.StatusCode != 400 || body != v1("Too many fields. Maximum number of fields is 10.") {
+		t.Fatalf("partial body: %d %s", res.StatusCode, body)
+	}
+
+	// A body of separators is parsed without holding it in memory.
+	separators := bytes.NewReader(bytes.Repeat([]byte("&"), 8<<20))
+	var before, after runtime.MemStats
+	runtime.GC()
+	runtime.ReadMemStats(&before)
+	f := &form{}
+	if err := readURLEncoded(separators, f); err != nil || len(f.values) != 0 {
+		t.Fatalf("%v %v", err, f.values)
+	}
+	runtime.ReadMemStats(&after)
+	if allocated := after.TotalAlloc - before.TotalAlloc; allocated > 1<<20 {
+		t.Fatalf("allocated %d bytes", allocated)
+	}
+}
+
+// A local storage failure is a logged 500 on both upload paths, and the log line carries
+// neither the blob path nor the upload ID.
+func TestStorageFailuresAreServerErrors(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root ignores directory permissions")
+	}
+	var logs bytes.Buffer
+	a := newAPI(t, nil)
+	a.log = slog.New(slog.NewJSONHandler(&logs, nil))
+	srv := serve(t, a)
+	blobs := filepath.Join(a.cfg.DataDir, "audio")
+	if err := os.Chmod(blobs, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.Chmod(blobs, 0o700) })
+
+	res, body := do(t, srv, "POST", "/v2/upload", clientKey, strings.NewReader("audio"))
+	if res.StatusCode != 500 || body != `{"error":"Internal Server Error"}` {
+		t.Fatalf("upload: %d %s", res.StatusCode, body)
+	}
+	form := "--b\r\nContent-Disposition: form-data; name=\"file\"; filename=\"a.wav\"\r\n\r\naudio\r\n--b--\r\n"
+	res, body = do(t, srv, "POST", "/v1/audio/transcriptions", clientKey, strings.NewReader(form),
+		"Content-Type", "multipart/form-data; boundary=b")
+	if res.StatusCode != 500 || body != `{"error":{"message":"Internal Server Error","type":"invalid_request_error","code":"500"}}` {
+		t.Fatalf("v1: %d %s", res.StatusCode, body)
+	}
+	// Invalid fields still win over the storage failure, as in Python.
+	bad := "--b\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\ntiny\r\n" + form
+	if res, body = do(t, srv, "POST", "/v1/audio/transcriptions", clientKey, strings.NewReader(bad),
+		"Content-Type", "multipart/form-data; boundary=b"); res.StatusCode != 400 {
+		t.Fatalf("v1 invalid model: %d %s", res.StatusCode, body)
+	}
+
+	lines := strings.Split(strings.TrimSpace(logs.String()), "\n")
+	if len(lines) != 2 {
+		t.Fatalf("log lines: %q", logs.String())
+	}
+	for _, line := range lines {
+		var entry map[string]any
+		if err := json.Unmarshal([]byte(line), &entry); err != nil {
+			t.Fatal(err)
+		}
+		if entry["msg"] != "request_failed" || entry["error"] != "open: permission denied" {
+			t.Fatalf("log line: %s", line)
+		}
+		if strings.Contains(line, a.cfg.DataDir) {
+			t.Fatalf("log line names a path: %s", line)
+		}
+	}
+	os.Chmod(blobs, 0o700)
+	if files := audioFiles(t, a); len(files) != 0 {
+		t.Fatalf("left audio files %v", files)
+	}
+}
+
+// sink is a ResponseWriter that keeps only the status and the body size.
+type sink struct {
+	header http.Header
+	status int
+	bytes  int
+}
+
+func (s *sink) Header() http.Header         { return s.header }
+func (s *sink) WriteHeader(code int)        { s.status = code }
+func (s *sink) Write(p []byte) (int, error) { s.bytes += len(p); return len(p), nil }
+
+func allocated(f func()) uint64 {
+	var before, after runtime.MemStats
+	runtime.GC()
+	runtime.ReadMemStats(&before)
+	f()
+	runtime.ReadMemStats(&after)
+	return after.TotalAlloc - before.TotalAlloc
+}
+
+// Reads of a completed transcript neither re-parse the stored result nor render the full
+// transcript again.
+func TestLargeTranscriptReadsDoNotReparse(t *testing.T) {
+	a := newAPI(t, nil)
+	uid, err := a.save(strings.NewReader("audio"), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	job, err := a.store.Submit(uid, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	claim := a.store.Claim()
+	var b strings.Builder
+	b.WriteString(`{"result":{"text":"` + strings.TrimSuffix(strings.Repeat("word ", 100_000), " ") + `","words":[`)
+	for i := range 100_000 {
+		if i > 0 {
+			b.WriteByte(',')
+		}
+		fmt.Fprintf(&b, `{"text":"word","start":%d,"end":%d,"confidence":0.5}`, i*100, i*100+50)
+	}
+	b.WriteString(`],"audio_duration_ms":10800000,"chunks":1,"seam_fallbacks":0}}`)
+	req := httptest.NewRequest("POST", "/internal/jobs/"+job.ID+"/complete", strings.NewReader(b.String()))
+	req.Header.Set("Authorization", workerKey)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Lease-Token", claim.Token)
+	rec := httptest.NewRecorder()
+	a.ServeHTTP(rec, req)
+	if rec.Code != 200 {
+		t.Fatalf("complete: %d %s", rec.Code, rec.Body)
+	}
+
+	get := func(path string) int {
+		req := httptest.NewRequest("GET", path, nil)
+		req.Header.Set("Authorization", clientKey)
+		w := &sink{header: http.Header{}}
+		a.ServeHTTP(w, req)
+		if w.status != 200 {
+			t.Fatalf("%s: %d", path, w.status)
+		}
+		return w.bytes
+	}
+	var size int
+	first := allocated(func() { size = get("/v2/transcript/" + job.ID) })
+	if first > uint64(2*size) {
+		t.Fatalf("first read of a %d byte transcript allocated %d bytes", size, first)
+	}
+	if again := allocated(func() { get("/v2/transcript/" + job.ID) }); again > 1<<20 {
+		t.Fatalf("second read allocated %d bytes", again)
+	}
+	var captions int
+	if used := allocated(func() { captions = get("/v2/transcript/" + job.ID + "/vtt") }); used > uint64(8*captions) {
+		t.Fatalf("%d bytes of captions allocated %d bytes", captions, used)
+	}
+}
+
+func TestTrailingSlashesRedirect(t *testing.T) {
+	a := newAPI(t, nil)
+	srv := serve(t, a)
+	client := &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+	for _, tc := range []struct{ method, path, key, status, location string }{
+		{"POST", "/v2/upload/", clientKey, "307", "/v2/upload"},
+		{"GET", "/v2/upload/", clientKey, "307", "/v2/upload"},
+		{"POST", "/v2/transcript//", clientKey, "307", "/v2/transcript"},
+		{"GET", "/v2/transcript/a%20b/?x=1&y", clientKey, "307", "/v2/transcript/a%20b?x=1&y"},
+		{"GET", "/v2/transcript/abc/srt/", clientKey, "307", "/v2/transcript/abc/srt"},
+		{"POST", "/v1/audio/transcriptions/", clientKey, "307", "/v1/audio/transcriptions"},
+		{"POST", "/internal/jobs/claim/", workerKey, "307", "/internal/jobs/claim"},
+		{"GET", "/health/live/", clientKey, "307", "/health/live"},
+		{"GET", "/health/live/", "", "401", ""},
+		{"GET", "/v2/nothing/", clientKey, "404", ""},
+		{"GET", "/", clientKey, "404", ""},
+	} {
+		req, _ := http.NewRequest(tc.method, srv.URL+tc.path, strings.NewReader("x"))
+		if tc.key != "" {
+			req.Header.Set("Authorization", tc.key)
+		}
+		res, err := client.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		body, _ := io.ReadAll(res.Body)
+		res.Body.Close()
+		if fmt.Sprint(res.StatusCode) != tc.status || res.Header.Get("Location") != tc.location ||
+			(tc.status == "307" && len(body) != 0) {
+			t.Fatalf("%s %s: %d %q %s", tc.method, tc.path, res.StatusCode, res.Header.Get("Location"), body)
+		}
 	}
 }

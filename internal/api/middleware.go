@@ -5,8 +5,10 @@ import (
 	"crypto/subtle"
 	"errors"
 	"io"
+	"io/fs"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"strings"
 	"sync"
@@ -47,9 +49,13 @@ func releaseSlot(r *http.Request) {
 	}
 }
 
+func hasBody(r *http.Request) bool {
+	return r.Body != nil && r.Body != http.NoBody && r.ContentLength != 0
+}
+
 // bodyConsumed reports whether the request body was read to its end.
 func bodyConsumed(r *http.Request) bool {
-	if r.Body == nil || r.Body == http.NoBody || r.ContentLength == 0 {
+	if !hasBody(r) {
 		return true
 	}
 	s := state(r)
@@ -61,16 +67,42 @@ func bodyConsumed(r *http.Request) bool {
 func (a *API) fail(w http.ResponseWriter, r *http.Request, err error) {
 	e := asAPIError(err)
 	if e == errInternal {
-		a.log.Error("request_failed", "method", r.Method, "route", routeName(r), "error", err.Error())
+		a.log.Error("request_failed", "method", r.Method, "route", routeName(r), "error", logCause(err))
 	}
 	if !bodyConsumed(r) {
 		w.Header().Set("Connection", "close")
+		// net/http still discards a small unread body after the handler; end that read now.
+		http.NewResponseController(w).SetReadDeadline(a.now())
 	}
 	writeError(w, r, e)
 }
 
+// logCause describes an internal error without the file paths, upload IDs or URLs that error
+// strings carry.
+func logCause(err error) string {
+	var pathErr *fs.PathError
+	var linkErr *os.LinkError
+	var urlErr *url.Error
+	switch {
+	case errors.As(err, &pathErr):
+		return pathErr.Op + ": " + pathErr.Err.Error()
+	case errors.As(err, &linkErr):
+		return linkErr.Op + ": " + linkErr.Err.Error()
+	case errors.As(err, &urlErr):
+		return urlErr.Op + ": request failed"
+	}
+	return err.Error()
+}
+
 // ServeHTTP authenticates and bounds every request before routing it.
 func (a *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	rc := http.NewResponseController(w)
+	if hasBody(r) {
+		// Bound every read of the body, including the discard net/http runs after the handler
+		// for a body it left unread. Without a deadline that read waits forever for a client
+		// that declared a body and never sends it. bodyReader moves the deadline per read.
+		rc.SetReadDeadline(a.now().Add(a.cfg.UploadIdle))
+	}
 	path := r.URL.Path
 	if path == "/health/live" || path == "/health/ready" {
 		a.route(w, r)
@@ -110,8 +142,7 @@ func (a *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	deadline := a.now().Add(a.cfg.SyncTimeout + transferLimit)
 	ctx, cancel := context.WithDeadline(r.Context(), deadline)
 	defer cancel()
-	rc := http.NewResponseController(w)
-	if r.Body != nil && r.Body != http.NoBody && r.ContentLength != 0 {
+	if hasBody(r) {
 		st.body = &bodyReader{
 			src:      http.MaxBytesReader(w, r.Body, limit),
 			rc:       rc,
@@ -127,10 +158,6 @@ func (a *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	gw := &guardWriter{ResponseWriter: w, deadline: deadline, now: a.now}
 	a.route(gw, inner)
-	if st.body != nil && !st.body.eof {
-		// Never leave a deadline behind for the server's own reads of this connection.
-		rc.SetReadDeadline(time.Time{})
-	}
 	if gw.timedOut() {
 		h := w.Header()
 		h.Del("Retry-After")

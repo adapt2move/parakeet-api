@@ -42,17 +42,24 @@ func (a *API) save(src io.Reader, p *pace) (string, error) {
 
 // writeBlob copies src into the audio file of a reserved upload. It stops at the first byte
 // beyond MaxUploadBytes with errAudioTooLarge, leaving the rest of src unread.
+// Failures of the local file come back as *storageError, apart from failures to read src.
 func (a *API) writeBlob(uid string, src io.Reader, p *pace) (int64, error) {
 	f, err := a.store.CreateBlob(uid)
 	if err != nil {
-		return 0, err
+		return 0, &storageError{err}
 	}
 	size, err := a.copyAudio(f, src, p)
 	if closeErr := f.Close(); err == nil && closeErr != nil {
-		err = closeErr
+		err = &storageError{closeErr}
 	}
 	return size, err
 }
+
+// storageError is a failure to store audio locally. It is a server error, never a client error.
+type storageError struct{ err error }
+
+func (e *storageError) Error() string { return "store audio: " + e.err.Error() }
+func (e *storageError) Unwrap() error { return e.err }
 
 func (a *API) copyAudio(dst io.Writer, src io.Reader, p *pace) (int64, error) {
 	deadline := a.now().Add(transferLimit)
@@ -73,7 +80,7 @@ func (a *API) copyAudio(dst io.Writer, src io.Reader, p *pace) (int64, error) {
 				return size, errTransferTimeout
 			}
 			if _, err := dst.Write(buf[:n]); err != nil {
-				return size, err
+				return size, &storageError{err}
 			}
 		}
 		if err == io.EOF {

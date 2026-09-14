@@ -234,6 +234,96 @@ def test_malformed_multipart_uses_the_v1_error_shape(api, case):
     assert error_message(response, v1=True)
 
 
+# Bodies where parsers disagree, answered as python-multipart parsed them. The file exceeds
+# MAX_UPLOAD_BYTES, so a file part the parser saw ends in 413 and a missed one in "no file".
+FORMAT_FIELD = b'--bnd\r\nContent-Disposition: form-data; name="response_format"\r\n\r\njson'
+FILE = b'Content-Disposition: form-data; name="file"; filename="a.wav"\r\n\r\n' + b"A" * 5000
+INVALID = "Invalid transcription options or audio"
+NO_FILE = "file must be an audio file"
+TOO_LARGE = "Audio too large"
+PARSING = {
+    "valid": (b"\r\n--bnd\r\n" + FILE + b"\r\n--bnd--\r\n", 413, TOO_LARGE),
+    "leading line break": (
+        b"\r\n" + FORMAT_FIELD + b"\r\n--bnd\r\n" + FILE + b"\r\n--bnd--\r\n",
+        413,
+        TOO_LARGE,
+    ),
+    "space after a delimiter is data": (b"\r\n--bnd \r\n" + FILE + b"\r\n--bnd--\r\n", 400, FORMAT),
+    "LF after a delimiter is data": (b"\r\n--bnd\n" + FILE + b"\r\n--bnd--\r\n", 400, FORMAT),
+    "CR alone after a delimiter is data": (b"\r\n--bnd\r" + FILE + b"\r\n--bnd--\r\n", 400, FORMAT),
+    "folded header": (b"\r\n--bnd\r\nX-A: 1\r\n  more\r\n" + FILE + b"\r\n--bnd--\r\n", 400, INVALID),
+    "LF-only header lines": (
+        b'\r\n--bnd\r\nContent-Disposition: form-data; name="file"; filename="a"\n\nA\r\n--bnd--\r\n',
+        400,
+        INVALID,
+    ),
+    "space before a header colon": (
+        b"\r\n--bnd\r\nContent-Disposition : x\r\n" + FILE + b"\r\n--bnd--\r\n",
+        400,
+        INVALID,
+    ),
+    "empty header name": (b"\r\n--bnd\r\n: x\r\n" + FILE + b"\r\n--bnd--\r\n", 400, INVALID),
+    "eight part headers": (b"\r\n--bnd\r\n" + b"X-A: 1\r\n" * 7 + FILE + b"\r\n--bnd--\r\n", 413, TOO_LARGE),
+    "nine part headers": (b"\r\n--bnd\r\n" + b"X-A: 1\r\n" * 8 + FILE + b"\r\n--bnd--\r\n", 400, INVALID),
+    "header line of 4224 bytes": (
+        b"\r\n--bnd\r\nX-A: " + b"v" * 4219 + b"\r\n" + FILE + b"\r\n--bnd--\r\n",
+        413,
+        TOO_LARGE,
+    ),
+    "header line of 4225 bytes": (
+        b"\r\n--bnd\r\nX-A: " + b"v" * 4220 + b"\r\n" + FILE + b"\r\n--bnd--\r\n",
+        400,
+        INVALID,
+    ),
+    "NUL in a part name": (
+        b'\r\n--bnd\r\nContent-Disposition: form-data; name="fi\x00le"; filename="a"\r\n\r\nA\r\n--bnd--\r\n',
+        422,
+        UNSUPPORTED,
+    ),
+    "epilogue after the closing delimiter": (
+        b"\r\n--bnd\r\n" + FILE + b"\r\n--bnd--junk\r\n--bnd\r\n",
+        413,
+        TOO_LARGE,
+    ),
+    "body ends inside the file": (b"\r\n--bnd\r\n" + FILE, 400, NO_FILE),
+    "body ends in a partial delimiter": (b"\r\n--bnd\r\n" + FILE + b"\r\n--bnd", 400, NO_FILE),
+    "part without a name": (
+        b"\r\n--bnd\r\nX-A: 1\r\n\r\nA\r\n--bnd--\r\n",
+        400,
+        'The Content-Disposition header field "name" must be provided.',
+    ),
+}
+
+
+def any_error_message(response):
+    """The message in either error shape; the shapes themselves are checked above."""
+    body = response.json()
+    if "detail" in body:
+        return body["detail"]
+    return error_message(response, v1=True)
+
+
+@pytest.mark.parametrize("case", PARSING)
+def test_multipart_parsing_matches_python_multipart(api, case):
+    rest, status, message = PARSING[case]
+    body = rest if case == "leading line break" else FORMAT_FIELD + rest
+    files = api.audio_files()
+    response = api.client.post(
+        PATH, content=body, headers={"content-type": "multipart/form-data; boundary=bnd"}
+    )
+    assert (response.status_code, any_error_message(response)) == (status, message)
+    assert api.audio_files() == files
+
+
+def test_multipart_boundary_length_is_limited(api):
+    for length, status, message in ((256, 413, TOO_LARGE), (257, 400, INVALID)):
+        boundary = "b" * length
+        body = f"--{boundary}\r\n".encode() + FILE + f"\r\n--{boundary}--\r\n".encode()
+        headers = {"content-type": f"multipart/form-data; boundary={boundary}"}
+        response = api.client.post(PATH, content=body, headers=headers)
+        assert (response.status_code, error_message(response, v1=True)) == (status, message)
+
+
 def test_worker_error_is_returned_as_422(api):
     files = api.audio_files()
     with ThreadPoolExecutor(1) as pool:

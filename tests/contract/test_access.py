@@ -2,6 +2,7 @@
 
 import json
 import uuid
+from urllib.parse import urlsplit
 
 import pytest
 
@@ -156,6 +157,31 @@ def test_unknown_routes_use_the_error_shapes(api):
     wrong_v1_method = api.client.get("/v1/audio/transcriptions")
     assert wrong_v1_method.status_code == 405
     assert error_message(wrong_v1_method, v1=True)
+
+
+def test_trailing_slashes_redirect_to_the_route(api):
+    for method, path, target in (
+        ("POST", "/v2/upload/", "/v2/upload"),
+        ("GET", "/v2/upload/", "/v2/upload"),
+        ("POST", "/v2/transcript//", "/v2/transcript"),
+        ("GET", f"/v2/transcript/{JOB}/?x=1&y", f"/v2/transcript/{JOB}?x=1&y"),
+        ("DELETE", f"/v2/transcript/{JOB}/", f"/v2/transcript/{JOB}"),
+        ("GET", f"/v2/transcript/{JOB}/srt/", f"/v2/transcript/{JOB}/srt"),
+        ("POST", "/v1/audio/transcriptions/", "/v1/audio/transcriptions"),
+        ("GET", "/metrics/", "/metrics"),
+        ("GET", "/health/live/", "/health/live"),
+    ):
+        response = api.client.request(method, path, content=b"x")
+        assert response.status_code == 307, path
+        assert response.content == b""
+        # Python sent an absolute URL built from the Host header; the target is what matters.
+        location = urlsplit(response.headers["location"])
+        assert location.path + ("?" + location.query if location.query else "") == target
+    assert api.worker.post("/internal/jobs/claim/").status_code == 307
+    assert api.anonymous.get("/health/live/").status_code == 401
+    assert api.client.get("/v2/nothing/").status_code == 404
+    followed = api.client.post("/v2/upload/", content=b"audio", follow_redirects=True)
+    assert followed.status_code == 200 and followed.json()["upload_url"]
 
 
 def test_metrics_count_jobs_by_status(start):

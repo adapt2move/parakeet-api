@@ -8,6 +8,7 @@ package formats
 
 import (
 	"math"
+	"slices"
 	"strconv"
 	"strings"
 	"unicode/utf8"
@@ -28,7 +29,8 @@ func ValidLanguage(code string) bool {
 
 // MarshalJSON renders the result as Python stored it: model_dump() with null speaker and channel.
 func (r *Result) MarshalJSON() ([]byte, error) {
-	b := []byte(`{"text":`)
+	b := make([]byte, 0, 160+len(r.Text)+wordsSize(r.Words))
+	b = append(b, `{"text":`...)
 	b = AppendString(b, r.Text)
 	b = append(b, `,"words":`...)
 	b = appendWords(b, r.Words)
@@ -39,6 +41,16 @@ func (r *Result) MarshalJSON() ([]byte, error) {
 	b = append(b, `,"seam_fallbacks":`...)
 	b = strconv.AppendInt(b, r.SeamFallbacks, 10)
 	return append(b, '}'), nil
+}
+
+// wordsSize estimates the rendered size of words, so that a buffer is allocated once instead of
+// growing through every doubling for a large transcript.
+func wordsSize(words []Word) int {
+	n := 2
+	for _, w := range words {
+		n += len(w.Text) + 100
+	}
+	return n
 }
 
 func appendWords(b []byte, words []Word) []byte {
@@ -128,7 +140,12 @@ func (t Transcript) Deleted() Transcript {
 
 // MarshalJSON renders the transcript as the Python API did.
 func (t Transcript) MarshalJSON() ([]byte, error) {
-	b := []byte(`{"id":`)
+	size := 300 + len(t.ID) + len(t.AudioURL) + wordsSize(t.Words)
+	if t.Text != nil {
+		size += len(*t.Text)
+	}
+	b := make([]byte, 0, size)
+	b = append(b, `{"id":`...)
 	b = AppendString(b, t.ID)
 	b = append(b, `,"status":`...)
 	b = AppendString(b, t.Status)
@@ -177,38 +194,41 @@ type Segment struct {
 // forms its own caption.
 func Segments(r *Result, maxChars int) []Segment {
 	segments := []Segment{}
-	var current []Word
-	chars := 0 // code points in the current words joined by spaces
-	flush := func() {
-		texts := make([]string, len(current))
-		for i, w := range current {
+	eachSegment(r.Words, maxChars, func(words []Word) {
+		texts := make([]string, len(words))
+		for i, w := range words {
 			texts[i] = w.Text
 		}
 		segments = append(segments, Segment{
 			ID:    len(segments),
-			Start: float64(current[0].Start) / 1000,
-			End:   float64(current[len(current)-1].End) / 1000,
+			Start: float64(words[0].Start) / 1000,
+			End:   float64(words[len(words)-1].End) / 1000,
 			Text:  strings.Join(texts, " "),
 		})
-	}
-	for _, w := range r.Words {
+	})
+	return segments
+}
+
+// eachSegment calls emit with the words of each caption, in order. The slices share words.
+func eachSegment(words []Word, maxChars int, emit func([]Word)) {
+	first := 0
+	chars := 0 // code points in words[first:i] joined by spaces
+	for i, w := range words {
 		length := utf8.RuneCountInString(w.Text)
-		if len(current) > 0 && (chars+length+1 > maxChars ||
-			w.End-current[0].Start > 6000 ||
-			w.Start-current[len(current)-1].End > 1500) {
-			flush()
-			current, chars = nil, 0
+		if i > first && (chars+length+1 > maxChars ||
+			w.End-words[first].Start > 6000 ||
+			w.Start-words[i-1].End > 1500) {
+			emit(words[first:i])
+			first, chars = i, 0
 		}
-		if len(current) > 0 {
+		if i > first {
 			chars++
 		}
 		chars += length
-		current = append(current, w)
 	}
-	if len(current) > 0 {
-		flush()
+	if first < len(words) {
+		emit(words[first:])
 	}
-	return segments
 }
 
 func appendSegments(b []byte, segments []Segment) []byte {
@@ -233,38 +253,91 @@ func appendSegments(b []byte, segments []Segment) []byte {
 // Timestamp formats seconds as HH:MM:SS,mmm (SRT) or HH:MM:SS.mmm (VTT), rounding half to even
 // like Python's round().
 func Timestamp(seconds float64, vtt bool) string {
+	return string(appendTimestamp(nil, seconds, vtt))
+}
+
+func appendTimestamp(b []byte, seconds float64, vtt bool) []byte {
 	ms := int64(math.RoundToEven(seconds * 1000))
 	hours, ms := ms/3600000, ms%3600000
 	minutes, ms := ms/60000, ms%60000
 	secs, ms := ms/1000, ms%1000
-	separator := ","
+	separator := byte(',')
 	if vtt {
-		separator = "."
+		separator = '.'
 	}
-	return pad(hours, 2) + ":" + pad(minutes, 2) + ":" + pad(secs, 2) + separator + pad(ms, 3)
+	b = appendPadded(b, hours, 2)
+	b = append(b, ':')
+	b = appendPadded(b, minutes, 2)
+	b = append(b, ':')
+	b = appendPadded(b, secs, 2)
+	b = append(b, separator)
+	return appendPadded(b, ms, 3)
 }
 
-func pad(n int64, width int) string {
-	s := strconv.FormatInt(n, 10)
-	if len(s) < width {
-		s = strings.Repeat("0", width-len(s)) + s
+func appendPadded(b []byte, n int64, width int) []byte {
+	var digits [20]byte
+	s := strconv.AppendInt(digits[:0], n, 10)
+	for i := len(s); i < width; i++ {
+		b = append(b, '0')
 	}
-	return s
+	return append(b, s...)
 }
-
-var subtitleEscaper = strings.NewReplacer("&", "&amp;", "<", "&lt;", ">", "&gt;")
 
 // Subtitles renders SRT or WebVTT captions of at most maxChars code points per caption.
 func Subtitles(r *Result, vtt bool, maxChars int) string {
-	var blocks []string
+	return string(AppendSubtitles(nil, r, vtt, maxChars))
+}
+
+// AppendSubtitles appends the captions Subtitles renders to b.
+func AppendSubtitles(b []byte, r *Result, vtt bool, maxChars int) []byte {
+	// Words, a separator per word and about 50 bytes of numbering and timestamps per caption.
+	b = slices.Grow(b, len(r.Text)+len(r.Words)*12+16)
 	if vtt {
-		blocks = append(blocks, "WEBVTT\n")
+		b = append(b, "WEBVTT\n"...)
 	}
-	for i, s := range Segments(r, maxChars) {
+	n := 0
+	eachSegment(r.Words, maxChars, func(words []Word) {
+		if n > 0 || vtt {
+			b = append(b, '\n')
+		}
+		n++
+		b = strconv.AppendInt(b, int64(n), 10)
+		b = append(b, '\n')
+		b = appendTimestamp(b, float64(words[0].Start)/1000, vtt)
+		b = append(b, " --> "...)
+		b = appendTimestamp(b, float64(words[len(words)-1].End)/1000, vtt)
+		b = append(b, '\n')
 		// Model text must not inject subtitle markup or cue separators.
-		blocks = append(blocks, strconv.Itoa(i+1)+"\n"+Timestamp(s.Start, vtt)+" --> "+Timestamp(s.End, vtt)+"\n"+subtitleEscaper.Replace(s.Text)+"\n")
+		for i, w := range words {
+			if i > 0 {
+				b = append(b, ' ')
+			}
+			b = appendEscaped(b, w.Text)
+		}
+		b = append(b, '\n')
+	})
+	return b
+}
+
+func appendEscaped(b []byte, s string) []byte {
+	start := 0
+	for i := 0; i < len(s); i++ {
+		var entity string
+		switch s[i] {
+		case '&':
+			entity = "&amp;"
+		case '<':
+			entity = "&lt;"
+		case '>':
+			entity = "&gt;"
+		default:
+			continue
+		}
+		b = append(b, s[start:i]...)
+		b = append(b, entity...)
+		start = i + 1
 	}
-	return strings.Join(blocks, "\n")
+	return append(b, s[start:]...)
 }
 
 // VerboseWord is one word in the OpenAI verbose_json response.

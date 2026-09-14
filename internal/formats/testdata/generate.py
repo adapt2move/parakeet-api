@@ -315,6 +315,36 @@ def completion_cases():
     ]
     for literal in float_literals:
         body(f"confidence_{literal}", splice({"result": one_word(confidence="@F")}, "@F", literal))
+    # Underscores in numeric strings, in values that pass every other check once parsed.
+    for literal in [
+        '"1_0"',
+        '"10_0.0"',
+        '" 1_0 "',
+        '"1__0"',
+        '"_10"',
+        '"10_"',
+        '"+_10"',
+        '"1_0."',
+        '"1.0_0"',
+        '"1_0.0_0"',
+    ]:
+        body(f"end_underscore_{literal}", splice({"result": one_word(start=0, end="@E")}, "@E", literal))
+    for literal in [
+        '"0.2_5"',
+        '"1_0e-1"',
+        '"1e-_1"',
+        '"._5"',
+        '"+_1"',
+        '"0_0.0_0"',
+        '"0.2__5"',
+        '"0.25_"',
+        '"_0.25"',
+        '" 0.2_5"',
+        '"0.2_5 "',
+    ]:
+        body(f"confidence_underscore_{literal}", splice({"result": one_word(confidence="@F")}, "@F", literal))
+    for literal in ['"  1_000  "', '"1_0_0"', '"1_000.00"']:
+        body(f"chunks_underscore_{literal}", splice({"result": base(chunks="@C")}, "@C", literal))
     text_literals = ["5", "true", "null", "[]", '"\\u0035"', '"\\ud83d\\ude00"', '"\\ud800"', '"\\udc00"']
     for literal in text_literals:
         body(

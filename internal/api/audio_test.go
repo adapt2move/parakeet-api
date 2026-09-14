@@ -3,12 +3,14 @@ package api
 import (
 	"bufio"
 	"context"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"reflect"
 	"strings"
 	"testing"
+	"testing/iotest"
 	"time"
 )
 
@@ -135,33 +137,67 @@ func TestParseOptionsHeader(t *testing.T) {
 func TestMultipartStart(t *testing.T) {
 	cases := []struct {
 		body    string
-		ok      bool
+		more    bool
 		err     error
 		remains string
 	}{
 		{"", false, nil, ""},
 		{"\r\n\r\n", false, nil, ""},
-		{"--b\r\nrest", true, nil, "--b\r\nrest"},
-		{"\r\n--b\r\nrest", true, nil, "--b\r\nrest"},
-		{"\r\njunk--b\r\nrest", true, nil, "--b\r\nrest"},
-		{"--b--", true, nil, "--b--"},
+		{"--b\r\nrest", true, nil, "rest"},
+		{"\r\n--b\r\nrest", true, nil, "rest"},
+		{"\r\njunk--b\r\nrest", true, nil, "rest"},
+		{"\n" + strings.Repeat("x", 64*1024) + "--b\r\n", false, errInvalidOptions, ""},
+		{"--b--", false, nil, ""},
+		{"--b--junk", false, nil, "junk"},
+		{"--b-x", false, errInvalidOptions, ""},
 		{"--b", false, nil, ""},
+		{"--b\r", false, nil, ""},
 		{"pre\r\n--b\r\n", false, errInvalidOptions, ""},
 		{"--c\r\n", false, errInvalidOptions, ""},
 		{"--b \r\n", false, errInvalidOptions, ""},
 		{"--b\n", false, errInvalidOptions, ""},
+		{"--b\rx", false, errInvalidOptions, ""},
 	}
 	for _, tc := range cases {
-		br := bufio.NewReaderSize(strings.NewReader(tc.body), 64*1024)
-		ok, err := multipartStart(br, "b")
-		if ok != tc.ok || err != tc.err {
-			t.Errorf("%q: got %v %v", tc.body, ok, err)
-			continue
+		p := &multipartParser{br: bufio.NewReaderSize(strings.NewReader(tc.body), 64*1024), delimiter: []byte("\r\n--b")}
+		more, err := p.start()
+		rest, _ := io.ReadAll(p.br)
+		if more != tc.more || err != tc.err || (err == nil && string(rest) != tc.remains) {
+			t.Errorf("%.20q: got %v %v, remains %q", tc.body, more, err, rest)
 		}
-		if ok {
-			rest, _ := br.Peek(br.Buffered())
-			if string(rest) != tc.remains {
-				t.Errorf("%q: remains %q", tc.body, rest)
+	}
+}
+
+// The part parser takes a delimiter only before CRLF or "--", and at the end of a truncated
+// body keeps back what could still start one, as python-multipart's partial match did.
+func TestPartReader(t *testing.T) {
+	cases := []struct {
+		body, data string
+		err        error
+		last       bool
+		remains    string
+	}{
+		{"abc\r\n--b\r\nnext", "abc", nil, false, "next"},
+		{"abc\r\n--b--epilogue", "abc", nil, true, "epilogue"},
+		{"a\r\n--b \r\n--bX\r\n--b-\r\r\n--b--", "a\r\n--b \r\n--bX\r\n--b-\r", nil, true, ""},
+		{"\r\n--b\r\n", "", nil, false, ""},
+		{"abc", "abc", errTruncated, false, ""},
+		{"abc\r\n-", "abc", errTruncated, false, ""},
+		{"abc\r\n--b", "abc", errTruncated, false, ""},
+		{"abc\r\n--b-", "abc", errTruncated, false, ""},
+		{"abc\r\n--b\r", "abc", errTruncated, false, ""},
+		{"abc\r\n--bZ", "abc\r\n--bZ", errTruncated, false, ""},
+		{"abc\r\n--b\n", "abc\r\n--b\n", errTruncated, false, ""},
+		{strings.Repeat("x\r\n--b \r\n-\r\n--", 20000) + "\r\n--b--", strings.Repeat("x\r\n--b \r\n-\r\n--", 20000), nil, true, ""},
+	}
+	for _, tc := range cases {
+		for _, size := range []int{16, 64 * 1024} {
+			p := &multipartParser{br: bufio.NewReaderSize(iotest.OneByteReader(strings.NewReader(tc.body)), size), delimiter: []byte("\r\n--b")}
+			part := &partReader{p: p}
+			data, err := io.ReadAll(part)
+			rest, _ := io.ReadAll(p.br)
+			if string(data) != tc.data || err != tc.err || part.last != tc.last || (err == nil && string(rest) != tc.remains) {
+				t.Errorf("%q (buffer %d): got %q %v last=%v, remains %q", tc.body, size, data, err, part.last, rest)
 			}
 		}
 	}

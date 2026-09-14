@@ -280,18 +280,41 @@ func intFrom(v *value) (int64, bool) {
 			sign, s = s[:1], s[1:]
 		}
 		whole, fraction, dotted := strings.Cut(s, ".")
-		if whole == "" || !allDigits(whole) || (dotted && (fraction == "" || strings.Trim(fraction, "0") != "")) {
+		digits, ok := intDigits(whole)
+		if !ok || (dotted && (fraction == "" || strings.Trim(fraction, "0") != "")) {
 			return 0, false
 		}
-		if len(strings.TrimLeft(whole, "0")) > maxIntDigits {
+		if len(strings.TrimLeft(digits, "0")) > maxIntDigits {
 			return 0, false
 		}
 		if sign == "+" {
 			sign = ""
 		}
-		return saturate(sign + whole), true
+		return saturate(sign + digits), true
 	}
 	return 0, false
+}
+
+// intDigits returns the digits of a non-empty run of digits in which single underscores may
+// separate digits, as pydantic's int parsing allows.
+func intDigits(s string) (string, bool) {
+	if s == "" {
+		return "", false
+	}
+	if !strings.Contains(s, "_") {
+		return s, allDigits(s)
+	}
+	digits := make([]byte, 0, len(s))
+	for i := 0; i < len(s); i++ {
+		switch c := s[i]; {
+		case isDigit(c):
+			digits = append(digits, c)
+		case c == '_' && i > 0 && i < len(s)-1 && isDigit(s[i-1]) && isDigit(s[i+1]):
+		default:
+			return "", false
+		}
+	}
+	return string(digits), true
 }
 
 func allDigits(s string) bool {
@@ -345,13 +368,23 @@ func floatFrom(v *value) (float64, bool) {
 	case kindFloat:
 		return finite(v.s)
 	case kindString:
-		s := strings.TrimFunc(v.s, unicode.IsSpace)
-		if !floatSyntax(s) {
-			return 0, false
+		if s := strings.TrimFunc(v.s, unicode.IsSpace); floatSyntax(s) {
+			return finite(s)
 		}
-		return finite(s)
+		// pydantic-core retries the untrimmed string without underscores. It only rejects
+		// leading, trailing and doubled underscores, so "1e_1" and "+_1" pass.
+		if s, ok := stripUnderscores(v.s); ok && floatSyntax(s) {
+			return finite(s)
+		}
 	}
 	return 0, false
+}
+
+func stripUnderscores(s string) (string, bool) {
+	if !strings.Contains(s, "_") || strings.HasPrefix(s, "_") || strings.HasSuffix(s, "_") || strings.Contains(s, "__") {
+		return "", false
+	}
+	return strings.ReplaceAll(s, "_", ""), true
 }
 
 // floatSyntax matches [+-]?(\d+\.?\d*|\.\d+)([eE][+-]?\d+)?

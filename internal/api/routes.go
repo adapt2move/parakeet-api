@@ -127,7 +127,34 @@ func (a *API) route(w http.ResponseWriter, r *http.Request) {
 		a.fail(w, r, errMethodNotAllowed)
 		return
 	}
+	if location, ok := slashRedirect(r); ok {
+		// Starlette's redirect_slashes; its Location was absolute, built from the Host header.
+		w.Header().Set("Location", location)
+		w.Header().Set("Content-Length", "0")
+		w.WriteHeader(http.StatusTemporaryRedirect)
+		return
+	}
 	a.fail(w, r, errNotFound)
+}
+
+// slashRedirect returns the path without trailing slashes, and the query, when that path has
+// a route for any method.
+func slashRedirect(r *http.Request) (string, bool) {
+	path := r.URL.EscapedPath()
+	if path == "/" || !strings.HasSuffix(path, "/") {
+		return "", false
+	}
+	segments := splitPath(strings.TrimRight(r.URL.Path, "/"))
+	for _, rt := range routes {
+		if _, ok := match(rt.pattern, segments); ok {
+			location := strings.TrimRight(path, "/")
+			if r.URL.RawQuery != "" {
+				location += "?" + r.URL.RawQuery
+			}
+			return location, true
+		}
+	}
+	return "", false
 }
 
 // reply writes a buffered handler result.
@@ -215,14 +242,30 @@ func (a *API) submitJob(r *http.Request) (response, error) {
 	return a.transcriptResponse(job, false)
 }
 
-// storedResult decodes the result the store keeps for a completed job. It was validated when the
-// worker sent it, so a failure is an internal error, never a client error.
-func storedResult(job store.Job) (*formats.Result, error) {
-	result, err := formats.DecodeResult(job.Result)
-	if err != nil {
-		return nil, errors.New("stored result does not decode")
+// completed is what the store keeps for a completed job: the validated result and, after the
+// first read, its rendered transcript, which every later read shares.
+type completed struct {
+	result     *formats.Result
+	once       sync.Once
+	transcript []byte
+}
+
+// stored returns what the store keeps for a completed job.
+func stored(job store.Job) (*completed, error) {
+	c, ok := job.Result.(*completed)
+	if !ok {
+		return nil, errors.New("stored result has an unexpected type")
 	}
-	return result, nil
+	return c, nil
+}
+
+// storedResult returns the result of a completed job.
+func storedResult(job store.Job) (*formats.Result, error) {
+	c, err := stored(job)
+	if err != nil {
+		return nil, err
+	}
+	return c.result, nil
 }
 
 // transcriptResponse renders a job as an AssemblyAI transcript.
@@ -232,11 +275,16 @@ func (a *API) transcriptResponse(job store.Job, deleted bool) (response, error) 
 		fj.LanguageCode = &code
 	}
 	if job.Result != nil {
-		result, err := storedResult(job)
+		c, err := stored(job)
 		if err != nil {
 			return response{}, err
 		}
-		fj.Result = result
+		fj.Result = c.result
+		if !deleted {
+			// Everything the transcript shows is fixed once the job completed.
+			c.once.Do(func() { c.transcript, _ = formats.Assembly(fj, a.cfg.PublicURL).MarshalJSON() })
+			return jsonResponse(c.transcript), nil
+		}
 	}
 	t := formats.Assembly(fj, a.cfg.PublicURL)
 	if deleted {
@@ -304,11 +352,11 @@ func (a *API) renderCaptions(r *http.Request, id, extension string) (response, e
 		return response{}, err
 	}
 	vtt := extension == "vtt"
-	text := formats.Subtitles(result, vtt, chars)
+	body := formats.AppendSubtitles(nil, result, vtt, chars)
 	if vtt {
-		return textResponse("text/vtt", text), nil
+		return response{status: http.StatusOK, contentType: "text/vtt; charset=utf-8", body: body}, nil
 	}
-	return response{status: http.StatusOK, contentType: "application/x-subrip", body: []byte(text)}, nil
+	return response{status: http.StatusOK, contentType: "application/x-subrip", body: body}, nil
 }
 
 // pydanticInt parses a query parameter as pydantic's lax int did: surrounding whitespace, a
@@ -433,9 +481,9 @@ func (a *API) complete(w http.ResponseWriter, r *http.Request, params []string) 
 		a.fail(w, r, err)
 		return
 	}
-	var result []byte
+	var result any
 	if c.Result != nil {
-		result, _ = c.Result.MarshalJSON()
+		result = &completed{result: c.Result}
 	}
 	message := ""
 	if c.Error != nil {
