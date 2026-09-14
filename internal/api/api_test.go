@@ -20,6 +20,12 @@ import (
 
 func newServer(t *testing.T, change func(*Settings)) (*API, *httptest.Server) {
 	t.Helper()
+	return newServerWithConnState(t, change, nil)
+}
+
+// newServerWithConnState also installs an http.Server ConnState hook.
+func newServerWithConnState(t *testing.T, change func(*Settings), connState func(net.Conn, http.ConnState)) (*API, *httptest.Server) {
+	t.Helper()
 	cfg := Settings{DataDir: t.TempDir(), APIKey: clientKey, WorkerKey: workerKey, PublicURL: "http://api.test",
 		MaxUploadBytes: 4096, MaxStorageBytes: 1 << 20, MaxPendingJobs: 8, Retention: time.Hour, MaxJobAge: time.Hour,
 		Lease: 15 * time.Second, MaxAttempts: 3, SyncTimeout: 5 * time.Second, UploadSlots: 1,
@@ -34,6 +40,7 @@ func newServer(t *testing.T, change func(*Settings)) (*API, *httptest.Server) {
 	a := New(cfg, st, slog.New(slog.DiscardHandler))
 	srv := httptest.NewUnstartedServer(a)
 	srv.Config = a.server()
+	srv.Config.ConnState = connState
 	srv.Start()
 	t.Cleanup(srv.Close)
 	return a, srv
@@ -243,9 +250,20 @@ func TestKeepAliveAfterABody(t *testing.T) {
 
 // A client that stops reading a response must not hold the handler and its audio file.
 func TestStalledResponseReaders(t *testing.T) {
-	a, srv := newServer(t, func(s *Settings) { s.MaxUploadBytes, s.MaxStorageBytes = 32<<20, 64<<20 })
-	audio := strings.Repeat("x", 32<<20)
-	id, err := a.store.Save(strings.NewReader(audio))
+	// A client that stops reading must not hold the handler, the connection or the audio
+	// file. Whether the client later sees the buffered bytes or EOF depends on the kernel,
+	// so the test watches the server side: the connection must be closed after the idle time.
+	closed := make(chan struct{}, 1)
+	a, srv := newServerWithConnState(t, func(s *Settings) { s.MaxUploadBytes, s.MaxStorageBytes = 32<<20, 64<<20 },
+		func(_ net.Conn, state http.ConnState) {
+			if state == http.StateClosed {
+				select {
+				case closed <- struct{}{}:
+				default:
+				}
+			}
+		})
+	id, err := a.store.Save(strings.NewReader(strings.Repeat("x", 32<<20)))
 	if err == nil {
 		_, err = a.store.Submit(id, "")
 	}
@@ -259,13 +277,16 @@ func TestStalledResponseReaders(t *testing.T) {
 	}
 	defer conn.Close()
 	conn.SetReadBuffer(4 << 10)
+	started := time.Now()
 	io.WriteString(conn, "GET /internal/jobs/"+claim.ID+"/audio HTTP/1.1\r\nHost: x\r\nAuthorization: "+workerKey+
 		"\r\nX-Lease-Token: "+claim.Token+"\r\n\r\n")
-	time.Sleep(a.cfg.UploadIdle + time.Second)
-	conn.SetReadDeadline(time.Now().Add(10 * time.Second))
-	received, err := io.Copy(io.Discard, conn)
-	if err != nil || received >= int64(len(audio)) {
-		t.Fatalf("received %d of %d bytes: %v", received, len(audio), err)
+	select {
+	case <-closed:
+		if elapsed := time.Since(started); elapsed < a.cfg.UploadIdle {
+			t.Fatalf("connection closed after %v, before the idle time", elapsed)
+		}
+	case <-time.After(a.cfg.UploadIdle + 5*time.Second):
+		t.Fatal("server kept the connection of a client that stopped reading")
 	}
 }
 
