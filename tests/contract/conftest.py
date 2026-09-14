@@ -1,8 +1,7 @@
 """Fixtures for the black-box contract suite; support.py holds the server harness.
 
-Run against the Python reference with `uv run pytest tests/contract -q`, or against the Go
-rewrite with `API_SERVER=go uv run pytest tests/contract -q`. Scenarios that need lease
-expiry, retention or job age are left to unit tests with an injectable clock.
+Run with `uv run pytest tests/contract -q`; it needs a Go toolchain. Scenarios that need lease
+expiry, retention or job age are left to Go unit tests with an injectable clock.
 """
 
 import subprocess
@@ -15,22 +14,11 @@ from .support import PROXIES, ROOT, SERVER, Launcher, sample_result
 @pytest.fixture(scope="session")
 def server_command(tmp_path_factory):
     """Returns a function mapping a port to the argv that serves the API on it."""
-    if SERVER == "python":
-        return lambda port: [
-            "uv",
-            "run",
-            "uvicorn",
-            "parakeet_api.api:app",
-            "--host",
-            "127.0.0.1",
-            "--port",
-            str(port),
-        ]
-    if SERVER == "go":
-        binary = tmp_path_factory.mktemp("go-build") / "parakeet-api"
-        subprocess.run(["go", "build", "-o", str(binary), "./cmd/parakeet-api"], cwd=ROOT, check=True)
-        return lambda port: [str(binary)]
-    raise pytest.UsageError("API_SERVER must be python or go")
+    if SERVER != "go":
+        raise pytest.UsageError("API_SERVER must be go; the Python API was removed")
+    binary = tmp_path_factory.mktemp("go-build") / "parakeet-api"
+    subprocess.run(["go", "build", "-o", str(binary), "./cmd/parakeet-api"], cwd=ROOT, check=True)
+    return lambda port: [str(binary)]
 
 
 @pytest.fixture(scope="session")

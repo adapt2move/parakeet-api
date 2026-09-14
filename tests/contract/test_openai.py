@@ -6,7 +6,7 @@ import httpx
 import pytest
 from openai import OpenAI
 
-from .support import API_KEY, SERVER, RawRequest, error_message, multipart, sample_result, wait_until
+from .support import API_KEY, RawRequest, error_message, multipart, sample_result, wait_until
 
 PATH = "/v1/audio/transcriptions"
 SRT = "1\n00:00:00,120 --> 00:00:01,700\nHello world.\n"
@@ -221,11 +221,6 @@ def test_malformed_multipart_is_rejected(api, case):
     assert api.claim() is None
 
 
-@pytest.mark.xfail(
-    SERVER == "python",
-    strict=True,
-    reason="Python bug: Starlette multipart errors bypass the /v1 handler and return {'detail': ...}",
-)
 @pytest.mark.parametrize("case", MALFORMED)
 def test_malformed_multipart_uses_the_v1_error_shape(api, case):
     body, headers = malformed(case)

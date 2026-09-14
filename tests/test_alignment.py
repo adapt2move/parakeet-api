@@ -2,7 +2,6 @@ import pytest
 
 from parakeet_api.alignment import words_from_result
 from parakeet_api.chunking import merge_words, windows
-from parakeet_api.formats import subtitles
 
 
 def test_subwords_keep_decoder_timing():
@@ -44,9 +43,3 @@ def test_windows_cover_end_without_extra_chunk():
     spans = list(windows(287 * 16000))
     assert len(spans) == 3 and spans[-1][1] == 287 * 16000
     assert spans[1][0] == 105 * 16000
-
-
-def test_subtitles_keep_alignment_and_escape_markup(result):
-    result["words"][0]["text"] = "<Hello>"
-    assert "&lt;Hello&gt;" in subtitles(result)
-    assert "00:00:00,120 --> 00:00:01,700" in subtitles(result)

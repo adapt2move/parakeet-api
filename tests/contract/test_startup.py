@@ -1,11 +1,11 @@
-"""Process-level behavior: settings validation, data directory ownership and Go-only startup changes."""
+"""Process-level behavior: settings validation, data directory ownership and startup."""
 
 import subprocess
 import uuid
 
 import pytest
 
-from .support import API_KEY, free_port, skip_unless_go
+from .support import API_KEY, free_port
 
 INVALID_SETTINGS = {
     "missing client key": {"API_KEY": None},
@@ -107,20 +107,17 @@ def test_memory_db_mode_is_accepted(start):
     assert server.anonymous.get("/health/live").json() == {"status": "ok"}
 
 
-@skip_unless_go
 def test_empty_db_mode_is_accepted(start):
     server = start(DB_MODE="")
     assert server.anonymous.get("/health/live").json() == {"status": "ok"}
 
 
-@skip_unless_go
 @pytest.mark.parametrize("mode", ["file", "sqlite"])
 def test_file_db_mode_was_removed(launcher, mode):
     logs = refused(launcher, DB_MODE=mode)
     assert "DB_MODE" in logs and "file" in logs.lower()
 
 
-@skip_unless_go
 def test_healthcheck_subcommand(launcher, start):
     binary = launcher.command(0)[0]
     server = start()

@@ -6,7 +6,7 @@ from urllib.parse import urlsplit
 
 import pytest
 
-from .support import API_KEY, SERVER, WORKER_KEY, RawRequest, error_message, multipart
+from .support import API_KEY, WORKER_KEY, RawRequest, error_message, multipart
 
 JOB = "00000000-0000-4000-8000-000000000000"
 CLIENT_ROUTES = [
@@ -138,11 +138,6 @@ def test_unknown_routes_are_not_found(api):
     assert api.worker.request("GET", "/internal/jobs/claim").status_code in (404, 405)
 
 
-@pytest.mark.xfail(
-    SERVER == "python",
-    strict=True,
-    reason="Python bug: FastAPI's default 404/405 handler returns {'detail': ...} instead of the API error shapes",
-)
 def test_unknown_routes_use_the_error_shapes(api):
     for path in ("/v2/nothing", "/metrics/extra", f"/uploads/{JOB}"):
         response = api.client.get(path)
@@ -174,7 +169,7 @@ def test_trailing_slashes_redirect_to_the_route(api):
         response = api.client.request(method, path, content=b"x")
         assert response.status_code == 307, path
         assert response.content == b""
-        # Python sent an absolute URL built from the Host header; the target is what matters.
+        # Only the redirect target matters, not whether the URL is absolute.
         location = urlsplit(response.headers["location"])
         assert location.path + ("?" + location.query if location.query else "") == target
     assert api.worker.post("/internal/jobs/claim/").status_code == 307
@@ -248,7 +243,6 @@ def test_logs_do_not_contain_secrets_urls_or_content(start):
         assert forbidden not in logs, forbidden
 
 
-@pytest.mark.skipif(SERVER != "go", reason="Go server logs JSON lines")
 def test_logs_are_json_lines(start):
     server = start()
     server.queue()

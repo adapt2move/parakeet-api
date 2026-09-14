@@ -50,12 +50,3 @@ def words_from_result(result, duration_ms):
     if content(" ".join(w["text"] for w in words)) != content(result["text"]):
         raise ValueError("Decoder text and tokens disagree")
     return words
-
-
-def validate_options(options):
-    # A caller label, not forced decoding or language identification.
-    language = options.get("language_code")
-    languages = "bg hr cs da nl en et fi fr de el hu it lv lt mt pl pt ro ru sk sl es sv uk".split()
-    if language is not None and language not in languages:
-        raise ValueError("Unsupported language_code")
-    return language

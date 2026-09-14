@@ -1,7 +1,7 @@
 """Harness for the black-box contract suite: every test talks to a real API process over TCP.
 
-API_SERVER=python (default) runs the FastAPI app with uvicorn; API_SERVER=go builds and runs
-./cmd/parakeet-api. Each server gets its own DATA_DIR and limits from its environment.
+The session builds ./cmd/parakeet-api once. Each server gets its own DATA_DIR and limits from its
+environment.
 """
 
 import contextlib
@@ -14,10 +14,9 @@ import time
 from pathlib import Path
 
 import httpx
-import pytest
 
 ROOT = Path(__file__).resolve().parents[2]
-SERVER = os.getenv("API_SERVER", "python")
+SERVER = os.getenv("API_SERVER", "go")
 API_KEY = "client-" + "x" * 32
 WORKER_KEY = "worker-" + "y" * 32
 UUID_PATTERN = r"[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}"
@@ -60,8 +59,6 @@ DEFAULTS = {
     # .invalid never resolves (RFC 6761), so allowed URLs fail without leaving the machine.
     "AUDIO_URL_HOSTS": "audio.invalid",
 }
-
-skip_unless_go = pytest.mark.skipif(SERVER != "go", reason="Go server only")
 
 
 def sample_result():
@@ -179,7 +176,7 @@ class Server:
 def stop_process(process):
     if process.poll() is not None:
         return
-    # The process leads its own session, so this also reaches children such as uv's uvicorn.
+    # The process leads its own session, so this also reaches any children.
     try:
         os.killpg(process.pid, signal.SIGTERM)
         process.wait(10)
