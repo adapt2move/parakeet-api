@@ -61,7 +61,7 @@ def main():
                 "--cpus",
                 "0.25",
                 "--memory",
-                "384m",
+                "256m",
                 "--read-only",
                 "-v",
                 "/data",

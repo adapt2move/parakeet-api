@@ -19,7 +19,7 @@ services:
     cap_drop: [ALL]
     security_opt: [no-new-privileges:true]
     cpus: 0.25
-    mem_limit: 384m
+    mem_limit: 256m
     restart: unless-stopped
   worker:
     image: ${WORKER_IMAGE:-ghcr.io/adapt2move/parakeet-worker:main}

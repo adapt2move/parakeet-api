@@ -24,7 +24,7 @@ For the distributed variant:
 kubectl -n parakeet scale deployment/parakeet-worker --replicas=2
 ```
 
-Each additional worker can consume up to 3.5 CPU and 6 GiB RAM. Reserve resources accordingly. Use the smaller limits from `compose.yaml` when testing on a Mac. API process restarts and upgrades lose all queued jobs and results. Clients must resubmit. There is no durable mode, and a PVC does not preserve jobs.
+Each additional worker can consume up to 3.5 CPU and 6 GiB RAM. Reserve resources accordingly. The API requests 50m CPU / 32 MiB and is limited to 500m / 256 MiB; see the README for how retained transcripts add up. Use the smaller limits from `compose.yaml` when testing on a Mac. API process restarts and upgrades lose all queued jobs and results. Clients must resubmit. There is no durable mode, and a PVC does not preserve jobs.
 
 Size the API `data` volume for `MAX_STORAGE_BYTES`. Uploads stream to disk within that quota.
 
