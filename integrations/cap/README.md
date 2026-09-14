@@ -1,63 +1,67 @@
-# Cap integration — prepared, not deployed
+# Cap with Parakeet
 
-The patch adds a configurable AssemblyAI endpoint to Cap and an explicit
-`parakeet` transcription profile. It covers full recordings, editable-transcript
-backfills and live recording chunks. The default AssemblyAI behavior is
-preserved when the profile is not set.
+Cap can use its existing upstream image with a Node preload module. Mount
+`runtime/preload.cjs` read-only and set:
 
-Apply it to [CapSoftware/Cap at the pinned revision](https://github.com/CapSoftware/Cap/tree/5786c3d6d64e1b63ee7012fe6e571480a8e73dd7)
-in `UPSTREAM_REVISION`. It changes source files, not generated Next.js bundles.
-The currently published upstream Cap image does not support these settings.
-
-| Variable | Value for Parakeet |
-| --- | --- |
-| `ASSEMBLYAI_BASE_URL` | Internal API origin, without `/v2` |
-| `ASSEMBLYAI_TRANSCRIPTION_PROFILE` | `parakeet` |
-| `ASSEMBLY_API_KEY` | Parakeet client key |
-
-The Parakeet profile sends only the audio and an optional language label. It
-omits AssemblyAI-specific model selection, language detection options and
-formatting/disfluency controls. Parakeet performs multilingual decoding without
-forced-language decoding or returning a detected language. Cap's broader
-language picker remains unchanged; explicit languages must be supported by the
-Parakeet model. The profile refuses to create a client without an explicit base
-URL, preventing accidental use of the cloud default.
-
-Build preparation, from the root of this repository:
-
-```sh
-cap_source="$(mktemp -d)"
-git clone --filter=blob:none https://github.com/CapSoftware/Cap.git "$cap_source"
-git -C "$cap_source" checkout "$(cat integrations/cap/UPSTREAM_REVISION)"
-git -C "$cap_source" apply --check "$PWD/integrations/cap/assemblyai-endpoint.patch"
-git -C "$cap_source" apply "$PWD/integrations/cap/assemblyai-endpoint.patch"
-docker build -f "$cap_source/apps/web/Dockerfile" -t cap-web:parakeet-candidate "$cap_source"
+```text
+NODE_OPTIONS=--require=/opt/parakeet/preload.cjs
+ASSEMBLYAI_BASE_URL=http://parakeet-api.parakeet.svc.cluster.local:8080
+ASSEMBLY_API_KEY=<Parakeet client key from a Secret>
 ```
 
-The patch and its reverse were checked against the pinned source. Nine scoped
-tests cover the existing cloud options, Parakeet requests, endpoint selection
-and rejection of a missing endpoint. The modified helper, environment schema
-and tests passed a scoped TypeScript check. Biome passed with one pre-existing
-unused-variable warning in the live workflow. The complete Cap container and
-workflow/UI tests have not been run; complete those before deploying a build.
+The module intercepts only the US/EU AssemblyAI HTTPS origins. Uploads, job
+submission, polling, deletion and subtitle requests go to the configured
+internal origin. Audio uploads remain streams. Other HTTP requests, including
+Cap storage, authentication and AI summaries, use the original fetch unchanged.
+Responses and word timestamps are returned unchanged.
 
-The real AssemblyAI JavaScript SDK 4.36.4, the patched client/options helper and
-Cap's existing edit-transcript/VTT conversion functions were tested against a
-running CPU Parakeet deployment on 2026-09-13:
+Job submission omits AssemblyAI-specific model selection, formatting and
+language-detection controls. Parakeet supplies its model's transcription and
+punctuation; it does not implement AssemblyAI's disfluency or forced-language
+controls. Only an optional supported language label is forwarded. Unknown
+features fail before a network request. The module refuses a missing client key
+or a cloud AssemblyAI target, and redirects from the internal API are disabled.
 
-| Input | Result | Total request time |
-| --- | --- | --- |
-| 286.891s recording | 502 words, timestamps preserved through Cap conversion | 80.85s |
-| 10.006s middle fMP4 fragment with initialization segment | 22 words, relative timestamps and valid VTT | 3.82s |
+`runtime/kustomization.yaml` generates the ConfigMap and a content hash. An
+infrastructure overlay can reference this directory at an immutable Git commit,
+mount `cap-parakeet-preload` and pin the Cap image digest. No application source
+or build step belongs in the infrastructure repository. Cap Pods do not fetch
+code at startup; Flux prepares the ConfigMap before starting them.
 
-The long recording used three decoder windows. The fragment test exercises the
-finite HTTP-upload format used by Cap's live workflow; it does not add an
-AssemblyAI streaming WebSocket endpoint. Test jobs were deleted after checking,
-and private recordings/transcripts are not included here.
+The tested upstream image is:
+
+```text
+ghcr.io/capsoftware/cap-web@sha256:8ee4cbd3fd87f88f538831aed06c954c525db9c2426a62abeaf0ca307c5e1ce9
+```
+
+Do not automatically advance the Cap image. Retest the module when changing
+Cap or its SDK, because this is a runtime adaptation rather than a supported
+Cap configuration flag. Six Node tests cover request conversion, upload bytes,
+result routes, unrelated requests and rejected configurations/features:
+
+```sh
+node --test integrations/cap/runtime/preload.test.cjs
+```
+
+The original compiled transcription step in the pinned image was exercised
+against a real CPU worker with a 71.723-second private recording. It returned
+127 words in 19.702 seconds, preserving all decoder word timestamps through
+Cap's editable transcript and VTT output. No image files were patched. Test
+jobs were deleted and private recordings/transcripts are not committed.
+
+`probe/` contains a synthetic speech fixture and a check that executes the
+original compiled Cap transcription and backfill steps, compares their word
+timestamps with the API response, and deletes its jobs. The fixture says:
+"This is an internal transcription test. Our own server returns words and
+accurate timestamps." It was generated with espeak-ng and encoded as AAC.
+The check needs the pinned Cap image, the preload module, `ASSEMBLYAI_BASE_URL`
+and `ASSEMBLY_API_KEY`; it must not be exposed as an HTTP endpoint.
+
+A [source patch](source-patch.md) is available as an alternative for a future
+Cap build or upstream contribution. It is not needed for this deployment.
 
 ## License
 
-Cap and `assemblyai-endpoint.patch` are covered by the accompanying AGPLv3
-[LICENSE](LICENSE), including Cap Software, Inc.'s copyright notice. Patch
-contributions: Copyright 2026 Adapt2Move GmbH. This directory does not change
-the EUPL-1.2 license of the Parakeet API application.
+The independently written runtime module is EUPL-1.2, like the Parakeet API.
+Copyright 2026 Adapt2Move GmbH. Cap and the optional source patch retain their
+AGPLv3 license and Cap Software, Inc. attribution in [LICENSE](LICENSE).
