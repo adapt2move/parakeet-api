@@ -114,7 +114,7 @@ async def execute(client, engine, job, shutdown):
             # Shield native inference so shutdown never deletes its input mid-decode.
             inference = asyncio.create_task(asyncio.to_thread(engine.transcribe, directory, cancel, progress))
             try:
-                result = await asyncio.shield(inference)
+                result, recoveries = await asyncio.shield(inference)
             except asyncio.CancelledError:
                 cancel.set()
                 with suppress(Exception):
@@ -130,6 +130,7 @@ async def execute(client, engine, job, shutdown):
                 words=len(result["words"]),
                 chunks=result["chunks"],
                 seam_fallbacks=result["seam_fallbacks"],
+                seam_recoveries=recoveries,
                 processing_ms=round((time.monotonic() - started) * 1000),
             )
     except LeaseLost:

@@ -35,7 +35,7 @@ class Engine:
         self.calls += 1
         if self.error:
             raise self.error
-        return RESULT
+        return RESULT, 0
 
 
 def run(worker, engine, completions):

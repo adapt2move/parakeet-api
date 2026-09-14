@@ -31,15 +31,17 @@ def merge_words(previous, incoming, window_start_ms, overlap_ms=15000):
     """Pick an unchanged acoustic alignment at a matched word inside the overlap.
 
     Only the overlap participates. Repeated phrases elsewhere are retained.
-    A temporal fallback handles overlap regions without a common recognition.
-    The caller records fallback counts for quality review.
+    Returns the merged words and the seam kind: None for a clean match,
+    "recovered" when the incoming window filled a passage the previous window
+    skipped, "fallback" for a temporal split without a common recognition.
+    The caller records seam counts for quality review.
     """
     if not previous:
-        return incoming, False
+        return incoming, None
     if not incoming:
-        return previous, False
+        return previous, None
     if previous[-1]["end"] <= incoming[0]["start"]:
-        return previous + incoming, False
+        return previous + incoming, None
     old = [(i, w) for i, w in enumerate(previous) if w["end"] >= window_start_ms]
     new = [(i, w) for i, w in enumerate(incoming) if w["start"] <= window_start_ms + overlap_ms]
     # Maximum contiguous matching run with a timing constraint. Window sizes
@@ -64,13 +66,29 @@ def merge_words(previous, incoming, window_start_ms, overlap_ms=15000):
         center = len(best) // 2
         candidates = [best[center]] + best[:center] + best[center + 1 :]
         for a, b in candidates:
+            merged = recovered(previous, incoming, a, b, window_start_ms)
+            if merged is not None:
+                return merged, "recovered"
             merged = previous[:a] + incoming[b:]
             if ordered(merged):
-                return merged, False
+                return merged, None
     cutoff = window_start_ms + overlap_ms / 2
     merged = [w for w in previous if (w["start"] + w["end"]) / 2 < cutoff] + [
         w for w in incoming if (w["start"] + w["end"]) / 2 >= cutoff
     ]
     if not ordered(merged):
         raise ValueError("Overlapping chunks have inconsistent word timing")
-    return merged, True
+    return merged, "fallback"
+
+
+def recovered(previous, incoming, a, b, window_start_ms, margin=3):
+    """Take the incoming window before the seam when the previous window skipped words there.
+
+    The decoder sometimes drops a passage right before a window edge. Both windows
+    hear the overlap, so a clearly longer incoming reading of it is the better one.
+    """
+    heard = sum(w["end"] > window_start_ms for w in previous[:a])
+    if b < heard + margin:
+        return None
+    merged = [w for w in previous if w["end"] <= incoming[0]["start"]] + incoming
+    return merged if ordered(merged) else None

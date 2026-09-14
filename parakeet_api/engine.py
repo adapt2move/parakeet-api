@@ -83,7 +83,7 @@ class Engine:
                     process.wait()
         count = output.stat().st_size // 4
         validate_duration(count, self.max_seconds)
-        combined, chunks, fallbacks = [], 0, 0
+        combined, chunks, seams = [], 0, {"fallback": 0, "recovered": 0}
         with output.open("rb") as pcm:
             for first, last in windows(count):
                 check()
@@ -102,17 +102,19 @@ class Engine:
                 for word in words:
                     word["start"] += first // 16
                     word["end"] += first // 16
-                combined, fallback = merge_words(combined, words, first // 16)
+                combined, seam = merge_words(combined, words, first // 16)
                 chunks += 1
-                fallbacks += int(fallback)
+                if seam:
+                    seams[seam] += 1
                 if len(combined) > 100000:
                     raise ValueError("Transcript word limit exceeded")
                 del stream, decoded, samples
                 check()
-        return Result(
+        result = Result(
             text=" ".join(w["text"] for w in combined),
             words=combined,
             audio_duration_ms=round(count / 16),
             chunks=chunks,
-            seam_fallbacks=fallbacks,
+            seam_fallbacks=seams["fallback"],
         ).model_dump()
+        return result, seams["recovered"]
