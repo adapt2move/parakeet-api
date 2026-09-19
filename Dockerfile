@@ -1,5 +1,5 @@
 # syntax=docker/dockerfile:1
-FROM python:3.11-slim-bookworm@sha256:1eef826191f05c3d47031c7a8fa3f88d0603bda82ce87c8ea6a73c743b0e0437 AS model
+FROM python:3.11-slim-trixie@sha256:45a610eb30c258a202b7000414e1ade0c3549cf5ce1ca16c369e0da116d0fa89 AS model
 COPY scripts/download_model.py /tmp/download_model.py
 RUN python /tmp/download_model.py
 
@@ -25,7 +25,7 @@ EXPOSE 8080
 HEALTHCHECK --interval=15s --timeout=3s CMD ["/parakeet-api", "healthcheck"]
 ENTRYPOINT ["/parakeet-api"]
 
-FROM python:3.11-slim-bookworm@sha256:1eef826191f05c3d47031c7a8fa3f88d0603bda82ce87c8ea6a73c743b0e0437 AS worker
+FROM python:3.11-slim-trixie@sha256:45a610eb30c258a202b7000414e1ade0c3549cf5ce1ca16c369e0da116d0fa89 AS worker
 LABEL org.opencontainers.image.source="https://github.com/adapt2move/parakeet-api" \
       org.opencontainers.image.licenses="EUPL-1.2" \
       org.opencontainers.image.vendor="Adapt2Move GmbH"
