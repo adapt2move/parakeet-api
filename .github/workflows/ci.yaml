@@ -29,7 +29,7 @@ jobs:
           if [ -n "$unformatted" ]; then echo "$unformatted"; exit 1; fi
           go vet ./...
           go test -race ./...
-      - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
         with:
           version: '0.8.22'
           python-version: '3.11'
@@ -81,7 +81,7 @@ jobs:
           tags: parakeet-worker:test
           cache-from: type=gha,scope=worker-${{ matrix.arch }}
           cache-to: type=gha,mode=max,scope=worker-${{ matrix.arch }}
-      - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
         with:
           version: '0.8.22'
           python-version: '3.11'
