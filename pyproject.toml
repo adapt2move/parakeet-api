@@ -19,7 +19,7 @@ dev = [
     "pytest>=8,<10",
     "ruff>=0.16.8,<1",
     "openai>=3.16.2,<4",
-    "assemblyai>=1.5.5,<2",
+    "assemblyai>=1.6.1,<2",
     "pydantic-settings>=2,<3",
 ]
 
