@@ -1,5 +1,5 @@
 # syntax=docker/dockerfile:1
-FROM python:3.11-slim-trixie@sha256:e529028263dbe6910a2d96f7d2b8f5266385e917fd45d286ef166977c094a51e AS model
+FROM python:3.11-slim-trixie@sha256:e88e9763f943ec1834f992a4b51e0f24500486803e8bc534e5767af9ea65f6ce AS model
 COPY scripts/download_model.py /tmp/download_model.py
 RUN python /tmp/download_model.py
 
@@ -25,7 +25,7 @@ EXPOSE 8080
 HEALTHCHECK --interval=15s --timeout=3s CMD ["/parakeet-api", "healthcheck"]
 ENTRYPOINT ["/parakeet-api"]
 
-FROM python:3.11-slim-trixie@sha256:e529028263dbe6910a2d96f7d2b8f5266385e917fd45d286ef166977c094a51e AS worker
+FROM python:3.11-slim-trixie@sha256:e88e9763f943ec1834f992a4b51e0f24500486803e8bc534e5767af9ea65f6ce AS worker
 LABEL org.opencontainers.image.source="https://github.com/adapt2move/parakeet-api" \
       org.opencontainers.image.licenses="EUPL-1.2" \
       org.opencontainers.image.vendor="Adapt2Move GmbH"
@@ -37,7 +37,7 @@ RUN pip install --no-cache-dir uv==0.8.22
 COPY pyproject.toml uv.lock ./
 # uv.lock never resolves pip/setuptools/wheel into .venv - these system copies are unused.
 RUN uv sync --frozen --no-dev --no-install-project --extra worker \
-    && python -m pip uninstall -y pip setuptools wheel \
+    && /usr/local/bin/python -m pip uninstall -y pip setuptools wheel \
     && rm -rf /usr/local/lib/python3.11/ensurepip
 RUN mkdir /scratch && chown 10001:10001 /scratch
 COPY --from=model /models /models
