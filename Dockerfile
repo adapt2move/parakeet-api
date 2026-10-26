@@ -31,8 +31,9 @@ ENTRYPOINT ["/parakeet-api"]
 FROM python-build AS ffmpeg-build
 ARG FFMPEG_VERSION=9.0.2
 RUN apk add --no-cache zlib-dev
+# Mirror the upstream release archive; the checksum pins the original bytes.
 ADD --checksum=sha256:8c3850283eb25fa026482078a04051e0be17347b09ef81a0849bec15a96e002e \
-    https://ffmpeg.org/releases/ffmpeg-${FFMPEG_VERSION}.tar.xz /tmp/ffmpeg.tar.xz
+    https://distfiles.macports.org/ffmpeg/ffmpeg-${FFMPEG_VERSION}.tar.xz /tmp/ffmpeg.tar.xz
 COPY scripts/build_ffmpeg.sh /tmp/build_ffmpeg.sh
 RUN mkdir /tmp/ffmpeg && tar -xJf /tmp/ffmpeg.tar.xz --strip-components=1 -C /tmp/ffmpeg \
     && cd /tmp/ffmpeg && sh /tmp/build_ffmpeg.sh \
