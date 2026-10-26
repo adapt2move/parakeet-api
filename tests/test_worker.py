@@ -101,8 +101,13 @@ def test_inference_failures_choose_retry_by_cause(worker, error, expected):
         (True, False, True, 503),
     ],
 )
-def test_health_route_reports_worker_readiness(worker, ready, stalled, loop_done, status):
-    worker.state.update(ready=ready, busy=stalled, progress=0 if stalled else worker.time.monotonic())
+@pytest.mark.parametrize("uptime", [1.0, 3600.0])
+def test_health_route_reports_worker_readiness(
+    worker, monkeypatch, uptime, ready, stalled, loop_done, status
+):
+    monkeypatch.setattr(worker, "time", types.SimpleNamespace(monotonic=lambda: uptime))
+    progress = worker.time.monotonic() - (worker.STALL_SECONDS + 1 if stalled else 0)
+    worker.state.update(ready=ready, busy=stalled, progress=progress)
     worker.app.state.loop = types.SimpleNamespace(done=lambda: loop_done)
 
     async def main():
