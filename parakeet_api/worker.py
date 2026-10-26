@@ -11,8 +11,9 @@ from contextlib import asynccontextmanager, suppress
 from pathlib import Path
 
 import httpx
-from fastapi import FastAPI
+from starlette.applications import Starlette
 from starlette.responses import JSONResponse
+from starlette.routing import Route
 
 from .engine import Engine
 
@@ -196,14 +197,13 @@ async def lifespan(app):
         await task
 
 
-app = FastAPI(lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None)
-
-
-@app.get("/health")
-async def health():
+async def health(request):
     ready = state["ready"] and not app.state.loop.done()
     healthy = ready and (not state["busy"] or time.monotonic() - state["progress"] < STALL_SECONDS)
     return JSONResponse(
         {"ready": healthy, "busy": state["busy"], "completed": state["completed"], "failed": state["failed"]},
         200 if healthy else 503,
     )
+
+
+app = Starlette(lifespan=lifespan, routes=[Route("/health", health)])

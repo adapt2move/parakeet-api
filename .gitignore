@@ -11,3 +11,4 @@ models/
 *.m4a
 *.mp3
 *.onnx
+/artifacts/

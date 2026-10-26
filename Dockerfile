@@ -1,9 +1,12 @@
 # syntax=docker/dockerfile:1
-FROM python:3.11-slim-trixie@sha256:e88e9763f943ec1834f992a4b51e0f24500486803e8bc534e5767af9ea65f6ce AS model
+FROM cgr.dev/chainguard/python:latest-dev@sha256:dde1a2549dd62864f0263dae8e877680837b4e738a7ecc85c671c55c069848ac AS python-build
+USER root
+
+FROM python-build AS model
 COPY scripts/download_model.py /tmp/download_model.py
 RUN python /tmp/download_model.py
 
-FROM --platform=$BUILDPLATFORM golang:1.27@sha256:03fd17ca31f26e3c8d5b83ae0606044133c59e0788784dd6f371da59cdb3b46f AS api-build
+FROM --platform=$BUILDPLATFORM golang:1.27.3-trixie@sha256:fbb7ae40b62ff8afe31662df570d39b4f5052ac32b90dae8e60d7657a20a74f4 AS api-build
 ARG TARGETOS TARGETARCH
 WORKDIR /src
 COPY go.mod ./
@@ -13,7 +16,7 @@ RUN CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH \
     go build -trimpath -ldflags "-s -w" -o /out/parakeet-api ./cmd/parakeet-api \
     && mkdir /out/data
 
-FROM gcr.io/distroless/static-debian12:nonroot@sha256:afa5c872c891853ca7fcf1f12c3edb23f7eeef36189728842dd51042ff57f7ab AS api
+FROM gcr.io/distroless/static-debian13:nonroot@sha256:18f4cc26c9ffa7f20a359298be7deadac5c607c8e03a02b8119f1a5fc2f82c99 AS api
 LABEL org.opencontainers.image.source="https://github.com/adapt2move/parakeet-api" \
       org.opencontainers.image.licenses="EUPL-1.2" \
       org.opencontainers.image.vendor="Adapt2Move GmbH"
@@ -25,25 +28,51 @@ EXPOSE 8080
 HEALTHCHECK --interval=15s --timeout=3s CMD ["/parakeet-api", "healthcheck"]
 ENTRYPOINT ["/parakeet-api"]
 
-FROM python:3.11-slim-trixie@sha256:e88e9763f943ec1834f992a4b51e0f24500486803e8bc534e5767af9ea65f6ce AS worker
+FROM python-build AS ffmpeg-build
+ARG FFMPEG_VERSION=9.0.2
+RUN apk add --no-cache zlib-dev
+ADD --checksum=sha256:8c3850283eb25fa026482078a04051e0be17347b09ef81a0849bec15a96e002e \
+    https://ffmpeg.org/releases/ffmpeg-${FFMPEG_VERSION}.tar.xz /tmp/ffmpeg.tar.xz
+COPY scripts/build_ffmpeg.sh /tmp/build_ffmpeg.sh
+RUN mkdir /tmp/ffmpeg && tar -xJf /tmp/ffmpeg.tar.xz --strip-components=1 -C /tmp/ffmpeg \
+    && cd /tmp/ffmpeg && sh /tmp/build_ffmpeg.sh \
+    && mkdir -p /out/share/doc/ffmpeg \
+    && cp COPYING.LGPLv2.1 /out/share/doc/ffmpeg/ \
+    && cp /tmp/ffmpeg.tar.xz /out/share/doc/ffmpeg/source.tar.xz \
+    && cp /tmp/build_ffmpeg.sh /out/share/doc/ffmpeg/build.sh
+
+FROM python-build AS worker-deps
+COPY --from=ghcr.io/astral-sh/uv:0.13.5@sha256:32a7bb39b496babbd997b0a39a4d66c126bdaf5661b302bf6f06abda8deca6ff /uv /usr/local/bin/uv
+ENV UV_PYTHON_DOWNLOADS=never UV_LINK_MODE=copy
+WORKDIR /app
+COPY pyproject.toml uv.lock ./
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv sync --locked --no-dev --no-install-project --no-build --extra worker --python /usr/bin/python3.15
+
+FROM python-build AS worker-rootfs
+ARG PYTHON_VERSION=3.15.1_git20261024-r0
+# Install only runtime packages into an empty root. Keep the APK database for scanners.
+RUN apk --root /runtime --initdb --no-scripts --keys-dir /etc/apk/keys \
+    --repositories-file /etc/apk/repositories add --no-cache \
+    python-3.15=${PYTHON_VERSION} libstdc++ libgomp ca-certificates-bundle wolfi-baselayout \
+    && mkdir -p /runtime/scratch \
+    && chown 10001:10001 /runtime/scratch
+
+FROM scratch AS worker
 LABEL org.opencontainers.image.source="https://github.com/adapt2move/parakeet-api" \
       org.opencontainers.image.licenses="EUPL-1.2" \
       org.opencontainers.image.vendor="Adapt2Move GmbH"
-ENV PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1 PATH=/app/.venv/bin:$PATH \
+ENV PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1 PATH=/app/.venv/bin:/usr/bin \
     OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1
 WORKDIR /app
-RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg && rm -rf /var/lib/apt/lists/*
-RUN pip install --no-cache-dir uv==0.8.22
-COPY pyproject.toml uv.lock ./
-# uv.lock never resolves pip/setuptools/wheel into .venv - these system copies are unused.
-RUN uv sync --frozen --no-dev --no-install-project --extra worker \
-    && /usr/local/bin/python -m pip uninstall -y pip setuptools wheel \
-    && rm -rf /usr/local/lib/python3.11/ensurepip
-RUN mkdir /scratch && chown 10001:10001 /scratch
+COPY --from=worker-rootfs /runtime/ /
+COPY --from=ffmpeg-build /out/usr/bin/ffmpeg /usr/bin/ffmpeg
+COPY --from=ffmpeg-build /out/share/doc/ffmpeg /usr/share/doc/ffmpeg
+COPY --from=worker-deps /app/.venv /app/.venv
 COPY --from=model /models /models
 COPY parakeet_api ./parakeet_api
 COPY LICENSE NOTICE ./
 USER 10001:10001
 EXPOSE 8765
 HEALTHCHECK --interval=15s --timeout=3s --start-period=120s CMD ["python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8765/health',timeout=2)"]
-CMD ["uvicorn", "parakeet_api.worker:app", "--host", "0.0.0.0", "--port", "8765", "--no-access-log", "--timeout-graceful-shutdown", "30"]
+CMD ["python", "-m", "uvicorn", "parakeet_api.worker:app", "--host", "0.0.0.0", "--port", "8765", "--no-access-log", "--timeout-graceful-shutdown", "30"]

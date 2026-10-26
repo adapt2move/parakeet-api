@@ -64,7 +64,7 @@ print(transcript.export_subtitles_vtt())
 aai.Transcript.delete_by_id(transcript.id)
 ```
 
-The SDK tests pin their dependencies in `uv.lock`. AssemblyAI 0.65.0 needs `pydantic-settings` when used with Pydantic 2; install it with the SDK in that environment.
+The SDK tests pin their dependencies in `uv.lock`.
 
 Speaker diarization, forced language selection, language identification, translation, prompts, word boosting, webhooks, summarization, realtime WebSockets and incremental SSE are not implemented. Unknown transcription options are rejected. `language_code` labels a request; the multilingual model still selects its own language. No language confidence is invented. AssemblyAI's separate synchronous `/transcribe` API is not implemented; its regular SDK offers a blocking call by polling `/v2/transcript`.
 
@@ -75,6 +75,8 @@ FFmpeg decodes the first audio track to mono 16 kHz PCM on disk. The model proce
 These are acoustic decoder alignments, not independently verified forced alignments. Recognition errors and words at chunk boundaries can affect accuracy. Confidence is the mean of decoder token probabilities, not a calibrated probability of transcription correctness. Subtitle segments group those words without inventing individual word times. Segment token IDs and Whisper-specific log-probability fields are omitted.
 
 Supported containers include WAV, M4A/MP4, MP3, FLAC, Ogg, WebM and other explicitly allowed FFmpeg formats. Audio must finish uploading before inference starts. HTTP chunked transfer is accepted by `/v2/upload`; that does not provide live transcription. Raw PCM without a container is not supported.
+
+CI checks 20 container/codec combinations, including AAC, ALAC, MP3, FLAC, Vorbis, Opus, PCM, ADPCM, WMA, AC-3 and WavPack. The decoder has no video codecs; it can extract supported audio from a video container.
 
 ## Model configuration
 
@@ -144,7 +146,7 @@ Run readiness/liveness checks for the API and the worker independently. API read
 
 ## Development and CI
 
-The API is Go 1.27 with the standard library only, in `cmd/parakeet-api` and `internal/`. The worker is Python, in `parakeet_api/`.
+The API is Go 1.27.3 with the standard library only, in `cmd/parakeet-api` and `internal/`. The worker is Python 3.15.1, in `parakeet_api/`. Its health endpoint uses Starlette directly; Pydantic validates transcription results. Use uv 0.13.5 or newer; `.python-version` pins the development interpreter.
 
 ```sh
 gofmt -l .
@@ -160,6 +162,8 @@ uv run pytest -q
 
 Go unit tests, the contract suite and SDK tests cover fenced leases, concurrent claims, retry exhaustion, queue/storage limits, deletion, retention, request authentication, response formats and timing conversion. CI builds native amd64 and arm64 images and transcribes synthetic speech through both SDKs before pushing either image. No customer recordings belong in this repository or CI artifacts.
 
+The workflow has three jobs: `test` runs code and API checks, `containers` builds and tests each architecture, and `manifests` publishes the combined tags once both architectures pass. Pull requests and manual runs on other branches test without publishing. Trivy reports image vulnerabilities in the logs without blocking publication. Python follows `.python-version`.
+
 To test a local recording without printing or saving its transcript:
 
 ```sh
@@ -168,7 +172,7 @@ docker build --target worker -t parakeet-worker:test .
 uv run python scripts/smoke.py /path/to/recording.m4a
 ```
 
-The smoke test submits three queued AssemblyAI requests and one OpenAI request, checks matching word timestamps, deletes results, then removes its containers and volumes. A quality benchmark needs a separate reference transcript; this smoke test does not measure word error rate.
+The smoke test submits three queued AssemblyAI requests and one OpenAI request, checks matching word timestamps, deletes results, then removes its containers and volumes. CI uses synthetic speech encoded as AAC/M4A. Run `uv run python scripts/check_audio.py /path/to/speech.wav` with host FFmpeg installed to check the decoder formats separately. A quality benchmark needs a separate reference transcript; this smoke test does not measure word error rate.
 
 ## License
 

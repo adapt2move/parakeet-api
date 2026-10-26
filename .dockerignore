@@ -5,6 +5,7 @@
 !LICENSE
 !NOTICE
 !scripts/download_model.py
+!scripts/build_ffmpeg.sh
 !go.mod
 !cmd
 !internal

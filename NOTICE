@@ -15,5 +15,9 @@ Changes to weights: ONNX conversion and INT8 quantization by upstream.
 No endorsement by NVIDIA, OpenAI or AssemblyAI is implied.
 
 sherpa-onnx is licensed under Apache-2.0.
-FFmpeg and Debian packages retain their respective licenses and notices in
-/usr/share/doc. Python dependency licenses are distributed in site-packages.
+FFmpeg is built without GPL or nonfree components under LGPL-2.1-or-later.
+The worker includes its complete source archive, build script and license in
+/usr/share/doc/ffmpeg. The upstream source is https://ffmpeg.org/.
+System packages retain their respective licenses. The worker's APK package
+metadata is in /lib/apk/db; API Debian metadata is in /var/lib/dpkg.
+Python dependency licenses are distributed in site-packages.

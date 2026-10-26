@@ -90,3 +90,28 @@ def test_lost_lease_reports_nothing(worker):
 )
 def test_inference_failures_choose_retry_by_cause(worker, error, expected):
     assert run(worker, Engine(error), [200]) == [expected]
+
+
+@pytest.mark.parametrize(
+    "ready,stalled,loop_done,status",
+    [
+        (True, False, False, 200),
+        (False, False, False, 503),
+        (True, True, False, 503),
+        (True, False, True, 503),
+    ],
+)
+def test_health_route_reports_worker_readiness(worker, ready, stalled, loop_done, status):
+    worker.state.update(ready=ready, busy=stalled, progress=0 if stalled else worker.time.monotonic())
+    worker.app.state.loop = types.SimpleNamespace(done=lambda: loop_done)
+
+    async def main():
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=worker.app), base_url="http://worker"
+        ) as client:
+            response = await client.get("/health")
+            assert response.status_code == status
+            assert response.json()["ready"] is (status == 200)
+            assert (await client.get("/unknown")).status_code == 404
+
+    asyncio.run(main())

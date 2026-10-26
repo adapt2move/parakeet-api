@@ -2,16 +2,15 @@
 name = "parakeet-api"
 version = "0.1.0"
 description = "CPU Parakeet transcription with OpenAI and AssemblyAI file APIs"
-requires-python = ">=3.11,<3.13"
+requires-python = ">=3.12,<3.16"
 license = "EUPL-1.2"
 authors = [{name = "Adapt2Move GmbH"}]
-dependencies = ["fastapi==0.143.3", "uvicorn==0.54.0", "httpx==0.28.1"]
+dependencies = ["starlette==1.10.0", "pydantic==2.14.1", "uvicorn==0.54.0", "httpx==0.28.1"]
 
 [project.optional-dependencies]
 worker = [
-    "sherpa-onnx==1.13.8",
-    "numpy==2.4.6",
-    "sherpa-onnx-core==1.13.8",
+    "sherpa-onnx==2.0.0",
+    "numpy==2.5.4",
 ]
 
 [dependency-groups]

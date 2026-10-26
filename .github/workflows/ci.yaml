@@ -20,7 +20,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
         with:
-          go-version: '1.27'
+          go-version: '1.27.3'
           # Standard library only: there is no go.sum to key a module cache on.
           cache: false
       - name: Go checks
@@ -31,17 +31,19 @@ jobs:
           go test -race ./...
       - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
         with:
-          version: '0.8.22'
-          python-version: '3.11'
-      - run: uv sync --frozen
-      - name: Python worker checks
-        run: uv run ruff check . && uv run ruff format --check . && uv run pytest -q --ignore=tests/contract
-      - name: API contract suite
-        run: uv run pytest tests/contract -q
+          version: '0.13.5'
+      - name: Install Python dependencies
+        run: uv sync --locked
+      - name: Python lint and tests
+        run: |
+          uv run --locked ruff check .
+          uv run --locked ruff format --check .
+          uv run --locked pytest -q
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: '24'
-      - run: node --test integrations/cap/runtime/preload.test.cjs
+      - name: Cap integration tests
+        run: node --test integrations/cap/runtime/preload.test.cjs
   containers:
     needs: test
     strategy:
@@ -59,39 +61,59 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
-      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
-        if: env.PUBLISH == 'true'
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-      - uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+      - name: Build API image
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
           target: api
+          platforms: linux/${{ matrix.arch }}
           load: true
           tags: parakeet-api:test
           cache-from: type=gha,scope=api-${{ matrix.arch }}
           cache-to: type=gha,mode=max,scope=api-${{ matrix.arch }}
-      - uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+      - name: Build worker image
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
           target: worker
+          platforms: linux/${{ matrix.arch }}
           load: true
           tags: parakeet-worker:test
           cache-from: type=gha,scope=worker-${{ matrix.arch }}
           cache-to: type=gha,mode=max,scope=worker-${{ matrix.arch }}
       - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
         with:
-          version: '0.8.22'
-          python-version: '3.11'
-      - name: Test real inference with synthetic speech
+          version: '0.13.5'
+      - name: Install smoke test dependencies
+        run: uv sync --locked
+      - name: Generate synthetic audio fixtures
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y espeak-ng
+          sudo apt-get install -y espeak-ng ffmpeg
           espeak-ng -s 135 -w /tmp/speech.wav 'Hello world. This recording tests accurate word timestamps and the transcription queue.'
-          uv sync --frozen
-          uv run python scripts/smoke.py /tmp/speech.wav
+          ffmpeg -nostdin -v error -i /tmp/speech.wav -c:a aac /tmp/speech.m4a
+      - name: Check compiled audio decoders
+        run: uv run --locked python scripts/check_audio.py /tmp/speech.wav
+      - name: Test transcription through both SDKs
+        run: uv run --locked python scripts/smoke.py /tmp/speech.m4a
+      # Report findings in the log; functional tests gate publication.
+      - uses: aquasecurity/setup-trivy@81e514348e19b6112ce2a7e3ecbafe19c1e1f567 # v0.3.1
+        continue-on-error: true
+        with:
+          version: v0.76.1
+      - name: Report image vulnerabilities
+        continue-on-error: true
+        run: |
+          for component in api worker; do
+            trivy image --scanners vuln --exit-code 0 "parakeet-$component:test"
+          done
+      - name: Log in to GHCR
+        if: env.PUBLISH == 'true'
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
       - name: Publish tested images
         if: env.PUBLISH == 'true'
         env:
@@ -104,6 +126,7 @@ jobs:
             docker push "$image:sha-$SHA-$ARCH"
           done
   manifests:
+    # Move public tags only after both architectures pass their container tests.
     if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')
     needs: containers
     runs-on: blacksmith-2vcpu-ubuntu-2404
