@@ -9,7 +9,7 @@ dependencies = ["starlette==1.10.0", "pydantic==2.14.1", "uvicorn==0.54.0", "htt
 
 [project.optional-dependencies]
 worker = [
-    "sherpa-onnx==2.0.0",
+    "sherpa-onnx==2.0.1",
     "numpy==2.5.4",
 ]
 
