@@ -1,5 +1,5 @@
 # syntax=docker/dockerfile:1@sha256:4edf897a3ffa55b89f906fc8cc78afdb3f1834cc9c7083565e611a8a7d5fe99e
-FROM cgr.dev/chainguard/python:latest-dev@sha256:01280a9ffd0c9c427d3127540203af6707ebf35cdb0481182aef303c03db239c AS python-build
+FROM cgr.dev/chainguard/python:latest-dev@sha256:29ab100be9f9be1ec5e31d7b7c384134171ee8f052e24e2285e697538c199aa6 AS python-build
 USER root
 
 FROM python-build AS model
@@ -16,7 +16,7 @@ RUN CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH \
     go build -trimpath -ldflags "-s -w" -o /out/parakeet-api ./cmd/parakeet-api \
     && mkdir /out/data
 
-FROM gcr.io/distroless/static-debian13:nonroot@sha256:18f4cc26c9ffa7f20a359298be7deadac5c607c8e03a02b8119f1a5fc2f82c99 AS api
+FROM gcr.io/distroless/static-debian13:nonroot@sha256:25ac8f0c3b2334a9eb05452266bd4697864a8c8ef0ef71e5e6480d7f92868329 AS api
 LABEL org.opencontainers.image.source="https://github.com/adapt2move/parakeet-api" \
       org.opencontainers.image.licenses="EUPL-1.2" \
       org.opencontainers.image.vendor="Adapt2Move GmbH"
@@ -43,7 +43,7 @@ RUN mkdir /tmp/ffmpeg && tar -xJf /tmp/ffmpeg.tar.xz --strip-components=1 -C /tm
     && cp /tmp/build_ffmpeg.sh /out/share/doc/ffmpeg/build.sh
 
 FROM python-build AS worker-deps
-COPY --from=ghcr.io/astral-sh/uv:0.13.6@sha256:af22a52f5eafef3d78e551599d405c02df61919d18028f0cea8eda93bc9986d0 /uv /usr/local/bin/uv
+COPY --from=ghcr.io/astral-sh/uv:0.13.7@sha256:96f40d3904aad8d0bd010539001d36c8e2188b981e1334471a90c4a1d93bb490 /uv /usr/local/bin/uv
 ENV UV_PYTHON_DOWNLOADS=never UV_LINK_MODE=copy
 WORKDIR /app
 COPY pyproject.toml uv.lock ./
