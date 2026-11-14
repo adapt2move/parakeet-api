@@ -20,7 +20,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
         with:
-          go-version: '1.27.3'
+          go-version: '1.27.4'
           # Standard library only: there is no go.sum to key a module cache on.
           cache: false
       - name: Go checks
@@ -31,7 +31,7 @@ jobs:
           go test -race ./...
       - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
         with:
-          version: '0.13.7'
+          version: '0.13.8'
       - name: Install Python dependencies
         run: uv sync --locked
       - name: Python lint and tests
@@ -83,7 +83,7 @@ jobs:
           cache-to: type=gha,mode=max,scope=worker-${{ matrix.arch }}
       - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
         with:
-          version: '0.13.7'
+          version: '0.13.8'
       - name: Install smoke test dependencies
         run: uv sync --locked
       - name: Generate synthetic audio fixtures
