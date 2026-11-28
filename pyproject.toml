@@ -5,12 +5,12 @@ description = "CPU Parakeet transcription with OpenAI and AssemblyAI file APIs"
 requires-python = ">=3.12,<3.16"
 license = "EUPL-1.2"
 authors = [{name = "Adapt2Move GmbH"}]
-dependencies = ["starlette==1.10.0", "pydantic==2.14.2", "uvicorn==0.54.0", "httpx==0.28.1"]
+dependencies = ["starlette==1.10.0", "pydantic==2.14.4", "uvicorn==0.54.0", "httpx==0.28.1"]
 
 [project.optional-dependencies]
 worker = [
-    "sherpa-onnx==2.0.1",
-    "numpy==2.5.4",
+    "sherpa-onnx==2.0.3",
+    "numpy==2.5.5",
 ]
 
 [dependency-groups]
